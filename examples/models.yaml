@@ -1,0 +1,4 @@
+# 将 id 替换为上游提供商实际支持的模型 ID；name 用作默认展示名称。
+models:
+  - id: REPLACE-WITH-UPSTREAM-MODEL-ID
+    name: 上游模型展示名称

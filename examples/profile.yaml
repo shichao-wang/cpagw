@@ -1,0 +1,21 @@
+# public_model 必须填写 Claude Code 暴露给调用方的官方 Claude 模型 ID，
+# 不要把上游 provider 的模型 ID 填到这里。以下均为需替换的占位符。
+models:
+  opus:
+    public_model: claude-REPLACE-WITH-OFFICIAL-PUBLIC-ID-OPUS
+    provider: example
+    connection: default
+    target_model: REPLACE-WITH-UPSTREAM-MODEL-ID
+    label: 主力模型映射
+  sonnet:
+    public_model: claude-REPLACE-WITH-OFFICIAL-PUBLIC-ID-SONNET
+    provider: example
+    connection: default
+    target_model: REPLACE-WITH-UPSTREAM-MODEL-ID
+    label: 均衡模型映射
+  haiku:
+    public_model: claude-REPLACE-WITH-OFFICIAL-PUBLIC-ID-HAIKU
+    provider: example
+    connection: default
+    target_model: REPLACE-WITH-UPSTREAM-MODEL-ID
+    label: 快速模型映射
