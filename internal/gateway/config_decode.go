@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/shichao-wang/cpa-tui/internal/config"
+	"github.com/shichao-wang/cpagw/internal/config"
 )
 
 // decodeModels 填充公开 key 类型的模型字段，不导入未被 SDK 导出的内部模型类型。

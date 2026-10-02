@@ -6,9 +6,9 @@ import (
 	"os"
 	"sort"
 
-	"github.com/shichao-wang/cpa-tui/internal/config"
-	"github.com/shichao-wang/cpa-tui/internal/provider"
-	"github.com/shichao-wang/cpa-tui/internal/store"
+	"github.com/shichao-wang/cpagw/internal/config"
+	"github.com/shichao-wang/cpagw/internal/provider"
+	"github.com/shichao-wang/cpagw/internal/store"
 	"github.com/spf13/cobra"
 )
 

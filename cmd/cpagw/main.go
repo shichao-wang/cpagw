@@ -7,7 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/shichao-wang/cpa-tui/internal/cli"
+	"github.com/shichao-wang/cpagw/internal/cli"
 )
 
 func main() {

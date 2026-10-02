@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/shichao-wang/cpa-tui/internal/store"
+	"github.com/shichao-wang/cpagw/internal/store"
 )
 
 const probeTimeout = 300 * time.Millisecond

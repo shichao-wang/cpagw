@@ -7,10 +7,10 @@ import (
 	"net"
 	"strconv"
 
-	"github.com/shichao-wang/cpa-tui/internal/agent/claudecode"
-	"github.com/shichao-wang/cpa-tui/internal/config"
-	"github.com/shichao-wang/cpa-tui/internal/server"
-	"github.com/shichao-wang/cpa-tui/internal/store"
+	"github.com/shichao-wang/cpagw/internal/agent/claudecode"
+	"github.com/shichao-wang/cpagw/internal/config"
+	"github.com/shichao-wang/cpagw/internal/server"
+	"github.com/shichao-wang/cpagw/internal/store"
 	"github.com/spf13/cobra"
 )
 

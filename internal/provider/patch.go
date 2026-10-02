@@ -2,8 +2,8 @@ package provider
 
 import (
 	"fmt"
-	"github.com/shichao-wang/cpa-tui/internal/config"
-	"github.com/shichao-wang/cpa-tui/internal/store"
+	"github.com/shichao-wang/cpagw/internal/config"
+	"github.com/shichao-wang/cpagw/internal/store"
 )
 
 // CreateProvider 仅创建提供商容器，协议、地址和模型由连接单独配置。

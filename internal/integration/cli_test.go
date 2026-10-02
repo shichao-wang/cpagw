@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shichao-wang/cpa-tui/internal/store"
+	"github.com/shichao-wang/cpagw/internal/store"
 )
 
 // TestBinaryFlow 通过实际 binary 验证用户命令、服务 socket 与配置接管，不访问真实上游。

@@ -11,8 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/shichao-wang/cpa-tui/internal/gateway"
-	"github.com/shichao-wang/cpa-tui/internal/store"
+	"github.com/shichao-wang/cpagw/internal/gateway"
+	"github.com/shichao-wang/cpagw/internal/store"
 )
 
 func TestStatusStoppedAndStalePID(t *testing.T) {

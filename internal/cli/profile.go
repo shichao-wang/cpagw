@@ -5,8 +5,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/shichao-wang/cpa-tui/internal/config"
-	"github.com/shichao-wang/cpa-tui/internal/profile"
+	"github.com/shichao-wang/cpagw/internal/config"
+	"github.com/shichao-wang/cpagw/internal/profile"
 	"github.com/spf13/cobra"
 )
 

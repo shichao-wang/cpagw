@@ -1,4 +1,4 @@
-module github.com/shichao-wang/cpa-tui
+module github.com/shichao-wang/cpagw
 
 go 1.27.1
 

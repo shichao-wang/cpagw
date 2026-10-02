@@ -1,7 +1,7 @@
 package store
 
 import (
-	"github.com/shichao-wang/cpa-tui/internal/config"
+	"github.com/shichao-wang/cpagw/internal/config"
 	"os"
 	"path/filepath"
 	"sync"

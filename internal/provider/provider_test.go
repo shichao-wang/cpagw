@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/shichao-wang/cpa-tui/internal/config"
-	"github.com/shichao-wang/cpa-tui/internal/store"
+	"github.com/shichao-wang/cpagw/internal/config"
+	"github.com/shichao-wang/cpagw/internal/store"
 )
 
 func TestParseModelsStrictAndUnique(t *testing.T) {
