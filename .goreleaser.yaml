@@ -1,0 +1,42 @@
+# GoReleaser 配置：推送 v* tag 时构建各平台产物与校验和（见 .github/workflows/release.yml）。
+# 需要 GoReleaser v2.6 以上（使用了 archives.formats 字段）。
+# 本地预览：goreleaser release --snapshot --clean
+version: 2
+
+project_name: cpagw
+
+builds:
+  - id: cpagw
+    main: ./cmd/cpagw
+    binary: cpagw
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s
+      - -w
+
+archives:
+  - id: cpagw
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - THIRD_PARTY_NOTICES
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+
+# 不设置 release.prerelease：tag 形如 v2026.10.5-abc123，其中的 -abc123 是 semver
+# 的预发布标识，若用 prerelease: auto 会被标记为 Pre-release，导致
+# /releases/latest 取不到、安装脚本默认版本失效。保持默认 false 与 make_latest 默认 true。

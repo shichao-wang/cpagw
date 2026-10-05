@@ -14,6 +14,25 @@ profile：下游 Agent 的专属 key、三档模型绑定与展示
 
 下游公开模型 ID 保持为 Claude ID。不同 profile 可以使用相同公开 ID，但展示不同名称并路由到不同上游。
 
+## 安装
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/shichao-wang/cpagw/main/scripts/install.sh | bash
+```
+
+脚本识别 macOS/Linux 与 amd64/arm64，从 [Releases](https://github.com/shichao-wang/cpagw/releases) 下载对应产物并用 `checksums.txt` 校验后安装。默认装到 `/usr/local/bin`，该目录不可写时回退到 `~/.local/bin`。
+
+可选环境变量：
+
+| 变量 | 说明 |
+|---|---|
+| `CPAGW_VERSION` | 指定版本（如 `v0.1.0`），默认为最新 Release |
+| `CPAGW_INSTALL_DIR` | 指定安装目录，优先级高于默认与回退规则 |
+
+安装包校验是强制环节，没有跳过开关：脚本比对 `checksums.txt` 中的 SHA256，不匹配即中止。该检查防的是传输损坏与只改动产物一侧的篡改，属于完整性校验，不构成对发布来源的认证。
+
+建议先下载脚本审阅再执行：`curl -fsSL <上述地址> -o install.sh`，检查无误后 `sh install.sh`。本工具暂不支持 Windows。
+
 ## 构建
 
 首期支持 macOS/Linux（进程管理依赖 Unix 信号及 `ps`），需要 Go 1.27.1 或更新版本：
@@ -25,6 +44,22 @@ cpagw --help
 ```
 
 SDK 固定为 CLIProxyAPI v8.0.10。分发时请附上 `THIRD_PARTY_NOTICES`，并遵守传递依赖的许可证。
+
+## 发布
+
+合并 PR 到 `main` 后自动打 tag 并发布 Release：
+
+```text
+合并 PR → ci 通过 → 打 tag（v2026.10.5-abc123）→ GoReleaser 发布 Release
+```
+
+tag 由日期与 commit 短 SHA 组成，不含补零（`2026.10.5` 而非 `2026.10.05`），否则不是合法 semver，GoReleaser 会拒绝。**直接 push 到 `main` 不会发布**，只有经 PR 合并的提交才触发。
+
+Release 不是预发布版，因此 `/releases/latest` 始终指向最新一次发布，安装脚本无需指定版本即可取用。手动发布可在目标 commit 上推一个 `v*` tag：
+
+```sh
+git tag v2026.10.5-abc123 && git push origin refs/tags/v2026.10.5-abc123
+```
 
 ## 接入提供商
 

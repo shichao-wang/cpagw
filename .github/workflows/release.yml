@@ -1,0 +1,126 @@
+name: release
+
+# PR 合并进 main 且测试通过后，自动打 tag 并发布 Release。
+#
+# 为什么只用一个文件：GITHUB_TOKEN 推送 tag 不会触发其它 workflow（GitHub 防递归
+# 限制），若把 CI 与发布拆开，跨 workflow 传递 tag 名只能靠反查，既脆弱又难验证。
+# 单个文件里 tag 是 job 输出，用 needs 串起「测试 → 打 tag → 发布」即可。
+# 推 tag 也不会触发本 workflow：on.push 限定了 branches: [main]。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+  tag:
+    needs: test
+    # 仅对合并进 main 的 push 打 tag；PR 事件只跑 test。
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    outputs:
+      tag: ${{ steps.calc.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: 计算版本
+        id: calc
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 仅对「由已合并 PR 引入 main」的提交打 tag；直接 push 到 main 不触发发布。
+          pr="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
+                 --jq '[.[] | select(.merged_at != null)] | .[0].number // empty')"
+          if [ -z "$pr" ]; then
+            echo "该提交不是由已合并 PR 引入 main，跳过打 tag"
+            exit 0
+          fi
+          short="$(git rev-parse --short=6 HEAD)"
+          # GNU date 的 %-m/%-d 去掉前导零，否则 patch 位会变成 "05" 这种非法 semver，
+          # GoReleaser 会拒绝该 tag。
+          tag="v$(date -u +%Y.%-m.%-d)-${short}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "tag ${tag} 已存在，跳过"
+            exit 0
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "PR #${pr} -> ${tag}"
+
+      - name: 打 tag 并推送
+        if: steps.calc.outputs.tag != ''
+        env:
+          TAG: ${{ steps.calc.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git tag "$TAG" HEAD
+          git push origin "refs/tags/$TAG"
+
+  release:
+    needs: tag
+    # tag job 判定跳过时输出为空，此时不发布。
+    if: needs.tag.outputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.tag.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 显式指定 tag，避免 GoReleaser 在 CI 中自行推断出错。
+          GORELEASER_CURRENT_TAG: ${{ needs.tag.outputs.tag }}
+
+      - name: 校验 Release 未被标为预发布
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          prerelease="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq '.prerelease')"
+          if [ "$prerelease" = "true" ]; then
+            echo "::error::${TAG} 被标记为 Pre-release，/releases/latest 会跳过它，安装脚本取不到默认版本。"
+            echo "::error::请确认 .goreleaser.yaml 未设置 release.prerelease: auto。"
+            exit 1
+          fi
+          echo "${TAG} 已发布且为 Latest，安装脚本可正常取用"
