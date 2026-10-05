@@ -1,0 +1,69 @@
+name: release
+
+# 由 tag workflow 触发：GITHUB_TOKEN 推送 tag 不会触发其它 workflow（GitHub 防递归限制），
+# 因此这里监听 tag workflow 结束，而不是 push tags。
+on:
+  workflow_run:
+    workflows: ["tag"]
+    types: [completed]
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - name: 解析 tag
+        id: vars
+        run: |
+          set -euo pipefail
+          git fetch --tags --force origin
+          # 取指向本次 commit 的版本 tag；tag workflow 判定跳过时这里为空。
+          tag="$(git tag --points-at HEAD | grep -E '^v[0-9]' | head -n1 || true)"
+          if [ -z "$tag" ]; then
+            echo "本次 commit 上没有版本 tag（tag workflow 可能已跳过），不发布"
+            exit 0
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "发布版本：${tag}"
+
+      - name: Setup Go
+        if: steps.vars.outputs.tag != ''
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run GoReleaser
+        if: steps.vars.outputs.tag != ''
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 分离头指针下显式指定 tag，避免 GoReleaser 自行推断出错。
+          GORELEASER_CURRENT_TAG: ${{ steps.vars.outputs.tag }}
+
+      - name: 校验 Release 未被标为预发布
+        if: steps.vars.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          set -euo pipefail
+          prerelease="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq '.prerelease')"
+          if [ "$prerelease" = "true" ]; then
+            echo "::error::${TAG} 被标记为 Pre-release，/releases/latest 会跳过它，安装脚本取不到默认版本。"
+            echo "::error::请确认 .goreleaser.yaml 未设置 release.prerelease: auto。"
+            exit 1
+          fi
+          echo "${TAG} 已发布且为 Latest，安装脚本可正常取用"

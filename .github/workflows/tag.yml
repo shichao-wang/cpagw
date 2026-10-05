@@ -1,0 +1,70 @@
+name: tag
+
+# PR 合并进 main 且 CI 通过后，自动打形如 v2026.10.5-abc123 的 tag。
+#
+# 为什么用 workflow_run 而不是 push：
+#   1. push 事件不含「本次提交由哪个 PR 合入」的信息，无法区分 PR 合并与直接 push；
+#   2. GITHUB_TOKEN 推送 tag 不会触发其它 workflow（GitHub 防递归限制），
+#      所以 release.yml 不能靠 push tag 触发，改为监听本 workflow 结束。
+on:
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: read
+  actions: read
+
+# 同一时刻只允许一个打 tag 任务，避免并发重复建 tag。
+concurrency:
+  group: tag-main
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - name: 计算版本
+        id: calc
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          # 仅对「由已合并 PR 引入 main」的提交打 tag；直接 push 到 main 不触发发布。
+          pr="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}/pulls" \
+                 --jq '[.[] | select(.merged_at != null)] | .[0].number // empty')"
+          if [ -z "$pr" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "该提交不是由已合并 PR 引入 main，跳过打 tag"
+            exit 0
+          fi
+          short="$(git rev-parse --short=6 "$SHA")"
+          # GNU date 的 %-m/%-d 去掉前导零，否则 patch 位会变成 "05" 这种非法 semver。
+          tag="v$(date -u +%Y.%-m.%-d)-${short}"
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "tag ${tag} 已存在，跳过"
+            exit 0
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "PR #${pr} -> ${tag}"
+
+      - name: 打 tag 并推送
+        if: steps.calc.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.calc.outputs.tag }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          git tag "$TAG" "$SHA"
+          git push origin "refs/tags/$TAG"
