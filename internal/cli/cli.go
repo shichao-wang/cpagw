@@ -19,6 +19,58 @@ type Options struct {
 	ProfileReferenced func(profileID string) (bool, error)
 }
 
+// VersionInfo 保存构建时注入的版本信息，供 version 命令输出。
+type VersionInfo struct {
+	Version string
+	Commit  string
+	Date    string
+}
+
+// version 由发布流程通过 ldflags -X 注入；从源码直接构建时保持为空。
+var version string
+
+// commit 由发布流程通过 ldflags -X 注入 commit 短 SHA。
+var commit string
+
+// date 由发布流程通过 ldflags -X 注入构建时间（RFC3339）。
+var date string
+
+// Version 返回构建时注入的版本信息；未注入时 Version 为空字符串。
+func Version() VersionInfo {
+	return VersionInfo{Version: version, Commit: commit, Date: date}
+}
+
+// formatVersion 拼接 version 命令的输出；各字段为空时省略对应行，均未注入时返回 unknown。
+func formatVersion(info VersionInfo) string {
+	var lines []string
+	if info.Version != "" {
+		lines = append(lines, "cpagw "+info.Version)
+	}
+	if info.Commit != "" {
+		lines = append(lines, "commit: "+info.Commit)
+	}
+	if info.Date != "" {
+		lines = append(lines, "构建时间: "+info.Date)
+	}
+	if len(lines) == 0 {
+		return "cpagw unknown（开发构建，版本信息未注入）"
+	}
+	return strings.Join(lines, "\n")
+}
+
+// newVersionCommand 展示构建时注入的版本信息。
+func newVersionCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "version",
+		Short: "显示版本信息",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			_, err := fmt.Fprintln(cmd.OutOrStdout(), formatVersion(Version()))
+			return err
+		},
+	}
+}
+
 // NewCommand 构建 cpagw 命令树；服务端和 agent 命令可由主程序继续挂载。
 func NewCommand() *cobra.Command {
 	return NewCommandWithOptions(Options{})
@@ -33,7 +85,10 @@ func NewCommandWithOptions(opts Options) *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
+	// 不设置 root.Version：cobra 仅在 Version 非空时注册 --version/-v，
+	// 本工具只用 version 子命令，避免两套入口输出不一致。
 	root.PersistentFlags().StringVar(&stateDir, "state-dir", "", "状态目录（默认：$XDG_CONFIG_HOME/cpagw 或 ~/.config/cpagw）")
+	root.AddCommand(newVersionCommand())
 	root.AddCommand(newProviderCommand(func() (*store.Store, error) { return store.New(stateDir) }, opts))
 	root.AddCommand(newProfileCommand(func() (*store.Store, error) { return store.New(stateDir) }, opts))
 	return root
