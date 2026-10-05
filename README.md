@@ -33,6 +33,16 @@ curl -fsSL https://raw.githubusercontent.com/shichao-wang/cpagw/main/scripts/ins
 
 建议先下载脚本审阅再执行：`curl -fsSL <上述地址> -o install.sh`，检查无误后 `sh install.sh`。本工具暂不支持 Windows。
 
+## 升级
+
+```sh
+cpagw upgrade
+```
+
+升级支持 macOS/Linux 的 amd64 与 arm64。命令只替换当前正在运行的 `cpagw` 实际可执行文件；通过符号链接启动时保留符号链接并更新其目标，不修改 cpagw 配置。它不会自动提权（`sudo`）、切换安装目录或重启网关进程；如果当前可执行文件所在目录不可写，升级会失败，请自行处理目录权限。网关正在运行时，升级后需手动重启。
+
+当前版本与最新 Release tag 相同时跳过替换；从源码构建或版本未知时，将替换为最新 Release。升级复用安装脚本的 `checksums.txt` SHA256 完整性校验边界，不代表对发布来源的认证。
+
 ## 构建
 
 首期支持 macOS/Linux（进程管理依赖 Unix 信号及 `ps`），需要 Go 1.27.1 或更新版本：
