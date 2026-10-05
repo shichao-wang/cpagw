@@ -28,7 +28,8 @@ curl -fsSL https://raw.githubusercontent.com/shichao-wang/cpagw/main/scripts/ins
 |---|---|
 | `CPAGW_VERSION` | 指定版本（如 `v0.1.0`），默认为最新 Release |
 | `CPAGW_INSTALL_DIR` | 指定安装目录，优先级高于默认与回退规则 |
-| `CPAGW_NO_VERIFY` | 设为非空跳过校验和验证（不推荐） |
+
+安装包校验是强制环节，没有跳过开关：脚本比对 `checksums.txt` 中的 SHA256，不匹配即中止。该检查防的是传输损坏与只改动产物一侧的篡改，属于完整性校验，不构成对发布来源的认证。
 
 建议先下载脚本审阅再执行：`curl -fsSL <上述地址> -o install.sh`，检查无误后 `sh install.sh`。本工具暂不支持 Windows。
 

@@ -6,7 +6,6 @@
 # 环境变量：
 #   CPAGW_VERSION        指定版本（如 v0.1.0），默认取最新 Release
 #   CPAGW_INSTALL_DIR    指定安装目录，默认 /usr/local/bin，不可写时回退 ~/.local/bin
-#   CPAGW_NO_VERIFY      设为任意非空值可跳过校验和验证（不推荐）
 set -eu
 
 REPO="shichao-wang/cpagw"
@@ -110,17 +109,15 @@ info "下载：${BASE_URL}/${ARCHIVE}"
 
 download "${BASE_URL}/${ARCHIVE}" "${TMP_DIR}/${ARCHIVE}"
 
-if [ -z "${CPAGW_NO_VERIFY:-}" ]; then
-	download "${BASE_URL}/checksums.txt" "${TMP_DIR}/checksums.txt"
-	expected="$(grep " ${ARCHIVE}\$" "${TMP_DIR}/checksums.txt" | cut -d ' ' -f 1 | head -n1)"
-	[ -n "$expected" ] || err "checksums.txt 中缺少 ${ARCHIVE} 的记录"
-	actual="$(sha256_of "${TMP_DIR}/${ARCHIVE}")"
-	[ -n "$actual" ] || err "找不到 shasum 或 sha256sum，无法校验；确认无误可设置 CPAGW_NO_VERIFY=1 跳过"
-	[ "$expected" = "$actual" ] || err "校验和不匹配，已中止安装"
-	info "校验和：ok"
-else
-	info "警告：已跳过校验和验证"
-fi
+# 校验和是强制环节，不提供跳过开关：能控制 Release 的攻击者可以同时替换产物与
+# checksums.txt，因此它防的是传输损坏与只改动产物一侧的篡改，属于完整性检查。
+download "${BASE_URL}/checksums.txt" "${TMP_DIR}/checksums.txt"
+expected="$(grep " ${ARCHIVE}\$" "${TMP_DIR}/checksums.txt" | cut -d ' ' -f 1 | head -n1)"
+[ -n "$expected" ] || err "checksums.txt 中缺少 ${ARCHIVE} 的记录"
+actual="$(sha256_of "${TMP_DIR}/${ARCHIVE}")"
+[ -n "$actual" ] || err "找不到 shasum 或 sha256sum，无法校验安装包完整性；请先安装 coreutils 后重试"
+[ "$expected" = "$actual" ] || err "校验和不匹配，已中止安装"
+info "校验和：ok"
 
 tar -xzf "${TMP_DIR}/${ARCHIVE}" -C "$TMP_DIR"
 [ -f "${TMP_DIR}/${BIN_NAME}" ] || err "压缩包中未找到 ${BIN_NAME}"
