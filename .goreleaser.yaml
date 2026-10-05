@@ -23,9 +23,11 @@ builds:
       - -s
       - -w
       # 注入 version 命令使用的版本信息；包路径须与 go.mod 的 module 一致。
+      # 用 .Date（GoReleaser 运行时刻）而非 .CommitDate（提交时间），
+      # 因为 version 命令展示的语义是构建时间。
       - -X github.com/shichao-wang/cpagw/internal/cli.version={{ .Tag }}
       - -X github.com/shichao-wang/cpagw/internal/cli.commit={{ .ShortCommit }}
-      - -X github.com/shichao-wang/cpagw/internal/cli.date={{ .CommitDate }}
+      - -X github.com/shichao-wang/cpagw/internal/cli.date={{ .Date }}
 
 archives:
   - id: cpagw
