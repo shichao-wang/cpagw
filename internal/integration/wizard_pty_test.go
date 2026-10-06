@@ -305,19 +305,48 @@ func (terminal *wizardTerminal) waitText(t *testing.T, text string) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	// 不打印原始终端输出，避免回归缺陷导致测试错误本身暴露密码。
-	t.Fatalf("终端未在限定时间内显示：%s", text)
+	// 仅输出脱敏后的测试界面，便于定位不同平台的输入时序问题。
+	clean := wizardCSI.ReplaceAllString(wizardOSC.ReplaceAllString(terminal.trace(), ""), "")
+	clean = strings.ReplaceAll(clean, wizardTestKey, "[隐藏测试凭证]")
+	if at := strings.Index(clean, "fake-pty"); at >= 0 {
+		clean = clean[:at] + "[隐藏测试凭证及后续输出]"
+	}
+	if len(clean) > 4096 {
+		clean = clean[len(clean)-4096:]
+	}
+	t.Fatalf("终端未在限定时间内显示：%s；脱敏界面：%q", text, clean)
 }
 
 func (terminal *wizardTerminal) send(t *testing.T, text string) {
 	t.Helper()
-	data := []byte(text)
-	for len(data) > 0 {
-		n, err := unix.Write(terminal.fd, data)
-		if err != nil || n == 0 {
-			t.Fatal("无法向测试终端发送输入")
+	write := func(value string) {
+		data := []byte(value)
+		for len(data) > 0 {
+			n, err := unix.Write(terminal.fd, data)
+			if err != nil || n == 0 {
+				t.Fatal("无法向测试终端发送输入")
+			}
+			data = data[n:]
 		}
-		data = data[n:]
+	}
+	// 按终端键盘事件驱动；文本按快速打字节奏逐字发送，方向键和提交仍是独立按键。
+	// Linux PTY 下更快的逐字写入会让表单事件循环偶发丢字，Enter 也可能先于输入处理。
+	time.Sleep(40 * time.Millisecond)
+	for _, part := range strings.SplitAfter(text, "\r") {
+		enter := strings.HasSuffix(part, "\r")
+		part = strings.TrimSuffix(part, "\r")
+		if strings.HasPrefix(part, "\x1b[") {
+			write(part)
+		} else {
+			for _, r := range part {
+				write(string(r))
+				time.Sleep(20 * time.Millisecond)
+			}
+		}
+		if enter {
+			time.Sleep(30 * time.Millisecond)
+			write("\r")
+		}
 	}
 }
 
