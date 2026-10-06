@@ -76,7 +76,7 @@ func Create(st *store.Store, file File) (string, error) {
 		if _, ok := s.Profiles[name]; ok {
 			return fmt.Errorf("profile 已存在：%s", name)
 		}
-		if err := s.ValidateProfile(p); err != nil {
+		if err := s.ValidateProfileStructure(p); err != nil {
 			return err
 		}
 		for slot, binding := range p.Models {
@@ -93,7 +93,7 @@ func Create(st *store.Store, file File) (string, error) {
 			}
 			p.Models[slot] = binding
 		}
-		if err := s.ValidateProfile(p); err != nil {
+		if err := s.ValidateProfileStructure(p); err != nil {
 			return err
 		}
 		s.Profiles[name] = p
@@ -129,7 +129,7 @@ func Update(st *store.Store, name string, file File) error {
 				p.Models[slot] = binding
 			}
 		}
-		if err := s.ValidateProfile(p); err != nil {
+		if err := s.ValidateProfileStructure(p); err != nil {
 			return err
 		}
 		s.Profiles[name] = p

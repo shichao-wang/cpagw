@@ -18,6 +18,7 @@ import (
 type Options struct {
 	OnChange          func() error
 	ProfileReferenced func(profileID string) (bool, error)
+	Login             func(context.Context, bool) (config.OAuthCredential, error)
 }
 
 type storeFactory func() (*store.Store, error)

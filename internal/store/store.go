@@ -164,8 +164,8 @@ func (s *Store) Read() (*config.State, error) {
 	if decoder.Decode(new(any)) != io.EOF {
 		return nil, fmt.Errorf("状态文件含多份 JSON，拒绝覆盖")
 	}
-	if state.SchemaVersion != 2 || state.Connections == nil || state.Profiles == nil || state.Secrets == nil {
-		return nil, fmt.Errorf("状态格式不兼容或无效；旧状态不会被修改，请使用新的 --state-dir 重新配置")
+	if err := state.Validate(); err != nil {
+		return nil, err
 	}
 	return state, nil
 }
@@ -176,6 +176,9 @@ func (s *Store) Update(fn func(*config.State) error) error {
 			return err
 		}
 		if err = fn(state); err != nil {
+			return err
+		}
+		if err = state.Validate(); err != nil {
 			return err
 		}
 		state.Revision++
@@ -241,6 +244,9 @@ func (s *Store) UpdateContext(ctx context.Context, fn func(*config.State) error)
 		return err
 	}
 	if err := fn(state); err != nil {
+		return err
+	}
+	if err := state.Validate(); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {

@@ -69,43 +69,67 @@ func ValidateConnection(c config.Connection) error {
 	if err := config.ValidateURL(c.BaseURL); err != nil {
 		return err
 	}
+	if c.AuthType != config.AuthAPIKey && c.AuthType != config.AuthCodexOAuth {
+		return fmt.Errorf("连接必须显式声明有效的认证方式")
+	}
+	if c.AuthType == config.AuthCodexOAuth && (c.Protocol != config.Responses || c.BaseURL != config.CodexBaseURL) {
+		return fmt.Errorf("Codex OAuth 仅支持 responses 协议和官方 API 地址")
+	}
 	return config.ValidateModels(c.Models)
 }
 
 // Create 新建全局唯一连接，并为其保存独立凭证。
 func Create(ctx context.Context, st *store.Store, c config.Connection, apiKey string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if err := ValidateConnection(c); err != nil {
 		return err
 	}
-	if err := config.ValidateKey(apiKey); err != nil {
-		return err
-	}
-	return st.UpdateContext(ctx, func(s *config.State) error {
-		if err := ctx.Err(); err != nil {
+	if c.AuthType == config.AuthAPIKey {
+		if err := config.ValidateKey(apiKey); err != nil {
 			return err
 		}
-		if _, ok := s.Connections[c.Name]; ok {
-			return fmt.Errorf("连接已存在：%s", c.Name)
-		}
-		ref, err := newSecretRef()
-		if err != nil {
-			return fmt.Errorf("生成凭证引用失败")
-		}
-		c.CredentialRef = ref
-		if s.Connections == nil {
-			s.Connections = make(map[string]config.Connection)
-		}
-		s.Connections[c.Name] = c
-		s.Secrets[ref] = apiKey
-		return nil
+	} else if apiKey != "" {
+		return fmt.Errorf("Codex OAuth 连接不能接收 API key")
+	}
+	id, err := config.RandomID()
+	if err != nil {
+		return fmt.Errorf("生成连接 ID 失败")
+	}
+	c.ID = id
+	return withOAuthRunLock(st, c.AuthType == config.AuthCodexOAuth, func() error {
+		return st.UpdateContext(ctx, func(s *config.State) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if _, ok := s.Connections[c.Name]; ok {
+				return fmt.Errorf("连接已存在：%s", c.Name)
+			}
+			if c.AuthType == config.AuthAPIKey {
+				ref, err := newSecretRef()
+				if err != nil {
+					return fmt.Errorf("生成凭证引用失败")
+				}
+				c.CredentialRef = ref
+				s.Secrets[ref] = apiKey
+			} else {
+				c.CredentialRef = ""
+			}
+			if s.Connections == nil {
+				s.Connections = make(map[string]config.Connection)
+			}
+			s.Connections[c.Name] = c
+			return nil
+		})
 	})
 }
 
-// Patch 在同一事务内更新连接地址、模型清单和凭证。
-func Patch(st *store.Store, name string, base *string, models *[]config.Model, key *string) error {
+// Patch 在同一事务内更新连接地址、模型清单、认证方式和凭证。
+func Patch(st *store.Store, name string, base *string, models *[]config.Model, key *string, authType *string) error {
 	if err := config.ValidateName(name); err != nil {
 		return err
 	}
@@ -119,51 +143,93 @@ func Patch(st *store.Store, name string, base *string, models *[]config.Model, k
 			return err
 		}
 	}
+	if authType != nil && *authType != config.AuthAPIKey && *authType != config.AuthCodexOAuth {
+		return fmt.Errorf("不支持的认证方式：%s", *authType)
+	}
 	if key != nil {
 		if err := config.ValidateKey(*key); err != nil {
 			return err
 		}
 	}
-	return st.Update(func(s *config.State) error {
-		c, ok := s.Connections[name]
-		if !ok {
-			return fmt.Errorf("连接不存在：%s", name)
-		}
-		if base != nil {
-			c.BaseURL = *base
-		}
-		if models != nil {
-			available := make(map[string]bool, len(*models))
-			for _, m := range *models {
-				available[m.ID] = true
+	before, err := st.Read()
+	if err != nil {
+		return err
+	}
+	original, ok := before.Connections[name]
+	if !ok {
+		return fmt.Errorf("连接不存在：%s", name)
+	}
+	requiresRunLock := authType != nil && *authType != original.AuthType && (original.AuthType == config.AuthCodexOAuth || *authType == config.AuthCodexOAuth)
+	return withOAuthRunLock(st, requiresRunLock, func() error {
+		return st.Update(func(s *config.State) error {
+			c, ok := s.Connections[name]
+			if !ok {
+				return fmt.Errorf("连接不存在：%s", name)
 			}
-			for _, profileName := range s.References(name, "") {
-				for _, binding := range s.Profiles[profileName].Models {
-					if binding.Connection == name && !available[binding.TargetModel] {
-						return fmt.Errorf("无法移除仍被 profile %s 使用的模型：%s", profileName, binding.TargetModel)
+			if c.ID != original.ID || c.AuthType != original.AuthType {
+				return fmt.Errorf("连接已变化，请重试更新")
+			}
+			oldRef := c.CredentialRef
+			if base != nil {
+				c.BaseURL = *base
+			}
+			if models != nil {
+				available := make(map[string]bool, len(*models))
+				for _, m := range *models {
+					available[m.ID] = true
+				}
+				for _, profileName := range s.References(name, "") {
+					for _, binding := range s.Profiles[profileName].Models {
+						if binding.Connection == name && !available[binding.TargetModel] {
+							return fmt.Errorf("无法移除仍被 profile %s 使用的模型：%s", profileName, binding.TargetModel)
+						}
 					}
 				}
+				c.Models = append([]config.Model(nil), (*models)...)
 			}
-			c.Models = append([]config.Model(nil), (*models)...)
-		}
-		oldRef := c.CredentialRef
-		if key != nil {
-			ref, err := newSecretRef()
-			if err != nil {
-				return fmt.Errorf("生成凭证引用失败")
+			if authType != nil && *authType != c.AuthType {
+				if *authType == config.AuthCodexOAuth {
+					if key != nil {
+						return fmt.Errorf("切换到 Codex OAuth 时不能同时设置 API key")
+					}
+					c.AuthType = config.AuthCodexOAuth
+					c.CredentialRef = ""
+				} else {
+					if key == nil {
+						return fmt.Errorf("切换到 API key 认证时必须显式提供 API key")
+					}
+					ref, err := newSecretRef()
+					if err != nil {
+						return fmt.Errorf("生成凭证引用失败")
+					}
+					c.AuthType = config.AuthAPIKey
+					c.CredentialRef = ref
+					s.Secrets[ref] = *key
+				}
+			} else if key != nil {
+				if c.AuthType != config.AuthAPIKey {
+					return fmt.Errorf("Codex OAuth 连接不能设置 API key")
+				}
+				ref, err := newSecretRef()
+				if err != nil {
+					return fmt.Errorf("生成凭证引用失败")
+				}
+				c.CredentialRef = ref
+				s.Secrets[ref] = *key
 			}
-			c.CredentialRef = ref
-			s.Secrets[ref] = *key
-		}
-		if err := ValidateConnection(c); err != nil {
-			return err
-		}
-		if _, err := s.Key(c); err != nil {
-			return err
-		}
-		s.Connections[name] = c
-		deleteIfUnreferenced(s, oldRef)
-		return nil
+			if err := ValidateConnection(c); err != nil {
+				return err
+			}
+			if c.AuthType == config.AuthAPIKey {
+				if _, err := s.Key(c); err != nil {
+					return err
+				}
+			}
+			s.Connections[name] = c
+			deleteIfUnreferenced(s, oldRef)
+			deleteOAuthIfUnreferenced(s, oldRef)
+			return nil
+		})
 	})
 }
 
@@ -172,17 +238,31 @@ func Remove(st *store.Store, name string) error {
 	if err := config.ValidateName(name); err != nil {
 		return err
 	}
-	return st.Update(func(s *config.State) error {
-		c, ok := s.Connections[name]
-		if !ok {
-			return fmt.Errorf("连接不存在：%s", name)
-		}
-		if refs := s.References(name, ""); len(refs) != 0 {
-			return fmt.Errorf("连接仍被 profile 使用：%s", strings.Join(refs, ", "))
-		}
-		delete(s.Connections, name)
-		deleteIfUnreferenced(s, c.CredentialRef)
-		return nil
+	state, err := st.Read()
+	if err != nil {
+		return err
+	}
+	original, ok := state.Connections[name]
+	if !ok {
+		return fmt.Errorf("连接不存在：%s", name)
+	}
+	return withOAuthRunLock(st, original.AuthType == config.AuthCodexOAuth, func() error {
+		return st.Update(func(s *config.State) error {
+			c, ok := s.Connections[name]
+			if !ok {
+				return fmt.Errorf("连接不存在：%s", name)
+			}
+			if c.ID != original.ID || c.AuthType != original.AuthType {
+				return fmt.Errorf("连接已变化，请重试删除")
+			}
+			if refs := s.References(name, ""); len(refs) != 0 {
+				return fmt.Errorf("连接仍被 profile 使用：%s", strings.Join(refs, ", "))
+			}
+			delete(s.Connections, name)
+			deleteIfUnreferenced(s, c.CredentialRef)
+			deleteOAuthIfUnreferenced(s, c.CredentialRef)
+			return nil
+		})
 	})
 }
 
@@ -233,6 +313,18 @@ func Check(ctx context.Context, c config.Connection, apiKey string) error {
 	return nil
 }
 
+func withOAuthRunLock(st *store.Store, required bool, fn func() error) error {
+	if !required {
+		return fn()
+	}
+	lock, err := st.AcquireRunLock()
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	return fn()
+}
+
 func newSecretRef() (string, error) {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -246,7 +338,7 @@ func deleteIfUnreferenced(s *config.State, ref string) {
 		return
 	}
 	for _, c := range s.Connections {
-		if c.CredentialRef == ref {
+		if c.AuthType == config.AuthAPIKey && c.CredentialRef == ref {
 			return
 		}
 	}
@@ -256,4 +348,16 @@ func deleteIfUnreferenced(s *config.State, ref string) {
 		}
 	}
 	delete(s.Secrets, ref)
+}
+
+func deleteOAuthIfUnreferenced(s *config.State, ref string) {
+	if ref == "" {
+		return
+	}
+	for _, c := range s.Connections {
+		if c.AuthType == config.AuthCodexOAuth && c.CredentialRef == ref {
+			return
+		}
+	}
+	delete(s.OAuthCredentials, ref)
 }

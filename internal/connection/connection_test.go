@@ -71,6 +71,7 @@ func TestCreateKeyRotationAndSharedCredentialGC(t *testing.T) {
 	}
 	if err := st.Update(func(s *config.State) error {
 		other := testConnection("other", "https://other.example.test")
+		other.ID = "other-id"
 		other.CredentialRef = first.CredentialRef
 		s.Connections[other.Name] = other
 		return nil
@@ -78,7 +79,7 @@ func TestCreateKeyRotationAndSharedCredentialGC(t *testing.T) {
 		t.Fatal(err)
 	}
 	newKey := "rotated-secret"
-	if err := Patch(st, "default", nil, nil, &newKey); err != nil {
+	if err := Patch(st, "default", nil, nil, &newKey, nil); err != nil {
 		t.Fatal(err)
 	}
 	after, err := st.Read()
@@ -110,7 +111,12 @@ func TestPatchIsAtomicAndGuardsReferencedModels(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := st.Update(func(s *config.State) error {
-		s.Profiles["demo"] = config.Profile{Models: map[string]config.Binding{"sonnet": {Connection: "c", TargetModel: "model-a"}}}
+		s.Secrets["profile-key"] = "profile-secret"
+		profile := config.Profile{Name: "demo", ID: "profile-id", Agent: "claude-code", KeyRef: "profile-key", Models: map[string]config.Binding{}}
+		for _, slot := range config.Slots {
+			profile.Models[slot] = config.Binding{PublicModel: "claude-" + slot, Connection: "c", TargetModel: "model-a"}
+		}
+		s.Profiles["demo"] = profile
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -122,7 +128,7 @@ func TestPatchIsAtomicAndGuardsReferencedModels(t *testing.T) {
 	newBase := "https://other.example.test"
 	newModels := []config.Model{{ID: "model-b"}}
 	newKey := "new-secret"
-	if err := Patch(st, "c", &newBase, &newModels, &newKey); err == nil {
+	if err := Patch(st, "c", &newBase, &newModels, &newKey, nil); err == nil {
 		t.Fatal("仍被 profile 引用的模型不得移除")
 	}
 	after, err := st.Read()
@@ -211,7 +217,7 @@ func testStore(t *testing.T) *store.Store {
 
 func testConnection(name, baseURL string) config.Connection {
 	return config.Connection{
-		Name: name, Protocol: config.Chat, BaseURL: baseURL,
+		Name: name, AuthType: config.AuthAPIKey, Protocol: config.Chat, BaseURL: baseURL,
 		Models: []config.Model{{ID: "model-a"}, {ID: "model-b"}},
 	}
 }

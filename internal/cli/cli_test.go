@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/shichao-wang/cpagw/internal/config"
 	"github.com/shichao-wang/cpagw/internal/connection"
@@ -26,7 +27,7 @@ func TestListAndShowNeverPrintSecretsOrReferences(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	conn := config.Connection{Name: "default", Protocol: config.Chat, BaseURL: "https://api.example.test", Models: []config.Model{{ID: "upstream-model"}}}
+	conn := config.Connection{Name: "default", AuthType: config.AuthAPIKey, Protocol: config.Chat, BaseURL: "https://api.example.test", Models: []config.Model{{ID: "upstream-model"}}}
 	if err := connection.Create(context.Background(), st, conn, "connection-api-secret"); err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +96,7 @@ func TestConnectionUpdatePreservesKeyUnlessRotated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	original := config.Connection{Name: "demo", Protocol: config.Chat, BaseURL: "https://old.example.test", Models: []config.Model{{ID: "old-model"}}}
+	original := config.Connection{Name: "demo", AuthType: config.AuthAPIKey, Protocol: config.Chat, BaseURL: "https://old.example.test", Models: []config.Model{{ID: "old-model"}}}
 	if err := connection.Create(context.Background(), st, original, "old-api-secret"); err != nil {
 		t.Fatal(err)
 	}
@@ -130,6 +131,138 @@ func TestConnectionUpdatePreservesKeyUnlessRotated(t *testing.T) {
 	updated = state.Connections["demo"]
 	if state.Secrets[updated.CredentialRef] != "rotated-api-secret" {
 		t.Fatal("key 轮换未生效")
+	}
+}
+
+func TestConnectionAuthTypeSwitchRequiresExplicitAPIKey(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "state")
+	st, err := store.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := config.Connection{Name: "switch", AuthType: config.AuthAPIKey, Protocol: config.Responses, BaseURL: "https://api.example.test", Models: []config.Model{{ID: "model"}}}
+	if err := connection.Create(context.Background(), st, c, "initial-api-secret"); err != nil {
+		t.Fatal(err)
+	}
+	root := NewCommand()
+	root.SetArgs([]string{"--state-dir", dir, "connection", "update", "switch", "--auth-type", config.AuthCodexOAuth})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("切换到 OAuth 失败：%v", err)
+	}
+	state, err := st.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oauthConn := state.Connections["switch"]
+	if oauthConn.AuthType != config.AuthCodexOAuth || oauthConn.BaseURL != config.CodexBaseURL || oauthConn.CredentialRef != "" {
+		t.Fatalf("OAuth 认证切换不正确：%+v", oauthConn)
+	}
+
+	root = NewCommand()
+	root.SetArgs([]string{"--state-dir", dir, "connection", "update", "switch", "--auth-type", config.AuthAPIKey})
+	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "必须显式提供 API key") {
+		t.Fatalf("切回 API key 未要求显式 key：%v", err)
+	}
+	root = NewCommand()
+	root.SetIn(strings.NewReader("new-api-secret\n"))
+	root.SetArgs([]string{"--state-dir", dir, "connection", "update", "switch", "--auth-type", config.AuthAPIKey, "--api-key-stdin"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("显式提供 key 后切换失败：%v", err)
+	}
+	state, err = st.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiConn := state.Connections["switch"]
+	if apiConn.AuthType != config.AuthAPIKey || state.Secrets[apiConn.CredentialRef] != "new-api-secret" {
+		t.Fatal("显式 API key 切换没有保存新凭证")
+	}
+}
+
+func TestCodexOAuthAddLoginCheckAndLogout(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	modelsPath := filepath.Join(t.TempDir(), "models.yaml")
+	if err := os.WriteFile(modelsPath, []byte("- id: codex-test\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	root := NewCommand()
+	root.SetArgs([]string{"--state-dir", dir, "connection", "add", "codex", "--auth-type", config.AuthCodexOAuth, "--protocol", config.Responses, "--models", modelsPath})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("OAuth 连接创建失败：%v", err)
+	}
+	st, err := store.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := st.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := state.Connections["codex"]
+	if created.ID == "" || created.AuthType != config.AuthCodexOAuth || created.BaseURL != config.CodexBaseURL || created.CredentialRef != "" {
+		t.Fatalf("OAuth 连接默认值错误：%+v", created)
+	}
+
+	loginCalls := 0
+	opts := Options{Login: func(_ context.Context, noBrowser bool) (config.OAuthCredential, error) {
+		loginCalls++
+		if !noBrowser {
+			t.Fatal("--no-browser 未传递给登录器")
+		}
+		return config.OAuthCredential{AccessToken: "access-secret", RefreshToken: "refresh-secret", IDToken: "identity-secret", AccountID: "private-account", ExpiresAt: time.Now().Add(time.Hour)}, nil
+	}}
+	var output bytes.Buffer
+	root = NewCommandWithOptions(opts)
+	root.SetOut(&output)
+	root.SetErr(&output)
+	root.SetArgs([]string{"--state-dir", dir, "connection", "login", "codex", "--no-browser"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("OAuth 登录失败：%v", err)
+	}
+	if loginCalls != 1 {
+		t.Fatalf("fake login 调用次数错误：%d", loginCalls)
+	}
+	for _, secret := range []string{"access-secret", "refresh-secret", "identity-secret", "private-account"} {
+		if strings.Contains(output.String(), secret) {
+			t.Fatalf("登录输出泄漏敏感值 %q", secret)
+		}
+	}
+	state, err = st.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	loggedIn := state.Connections["codex"]
+	if loggedIn.ID != created.ID || loggedIn.CredentialRef == "" || state.OAuthCredentials[loggedIn.CredentialRef].AccessToken != "access-secret" {
+		t.Fatal("登录凭证没有绑定到原连接")
+	}
+
+	output.Reset()
+	root = NewCommand()
+	root.SetOut(&output)
+	root.SetErr(&output)
+	root.SetArgs([]string{"--state-dir", dir, "connection", "check", "codex"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("OAuth 本地 check 失败：%v", err)
+	}
+	if !strings.Contains(output.String(), "未请求通用 /models") {
+		t.Fatalf("OAuth check 未说明不发送通用模型目录请求：%q", output.String())
+	}
+
+	root = NewCommand()
+	root.SetArgs([]string{"--state-dir", dir, "connection", "logout", "codex", "--yes"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("OAuth logout 失败：%v", err)
+	}
+	state, err = st.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	loggedOut := state.Connections["codex"]
+	if loggedOut.ID != created.ID || loggedOut.AuthType != config.AuthCodexOAuth || loggedOut.CredentialRef != "" || len(state.OAuthCredentials) != 0 {
+		t.Fatalf("logout 未保留连接身份或未清除本地 OAuth：%+v", loggedOut)
 	}
 }
 
@@ -262,7 +395,7 @@ func TestConnectionWizardCreatesWithoutLeakingSecret(t *testing.T) {
 	if err := os.Chmod(dir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	p := &fakePrompter{terminal: true, lines: []string{"demo", "https://api.example.test", "upstream-model=Display", "other-model"}, selections: []string{config.Chat, "direct", "continue", "finish"}, secret: "wizard-api-secret", confirm: true}
+	p := &fakePrompter{terminal: true, lines: []string{"demo", "https://api.example.test", "upstream-model=Display", "other-model"}, selections: []string{config.AuthAPIKey, config.Chat, "direct", "continue", "finish"}, secret: "wizard-api-secret", confirm: true}
 	var output, stderr bytes.Buffer
 	// 用私有命令构造器注入向导输入，避免扩大公开 Options。
 	cmd := newConnectionCommandWithPrompter(func() (*store.Store, error) { return store.New(dir) }, Options{}, p)
@@ -293,6 +426,7 @@ func TestConnectionWizardCreatesWithoutLeakingSecret(t *testing.T) {
 		t.Fatalf("继续录入/完成菜单生成了错误模型清单：%+v", created.Models)
 	}
 	wantMenus := [][]promptOption{
+		{{label: "API key（默认）", value: config.AuthAPIKey}, {label: "Codex OAuth", value: config.AuthCodexOAuth}},
 		{{label: "Chat Completions", value: config.Chat}, {label: "Anthropic Messages", value: config.Anthropic}, {label: "Responses", value: config.Responses}},
 		{{label: "直接录入", value: "direct"}, {label: "YAML 文件", value: "yaml"}},
 		{{label: "完成录入", value: "finish"}, {label: "继续添加模型", value: "continue"}},
@@ -319,12 +453,12 @@ func TestConnectionWizardCancellationAndInvalidInputDoNotSave(t *testing.T) {
 		name string
 		p    *fakePrompter
 	}{
-		{name: "取消确认", p: &fakePrompter{terminal: true, lines: []string{"demo", "https://api.example.test", "upstream-model"}, selections: []string{config.Chat, "direct", "finish"}, secret: "wizard-api-secret", confirm: false}},
+		{name: "取消确认", p: &fakePrompter{terminal: true, lines: []string{"demo", "https://api.example.test", "upstream-model"}, selections: []string{config.AuthAPIKey, config.Chat, "direct", "finish"}, secret: "wizard-api-secret", confirm: false}},
 		{name: "EOF", p: &fakePrompter{terminal: true, lines: []string{"demo"}}},
 		{name: "控制字符", p: &fakePrompter{terminal: true, lines: []string{"bad\x1fname"}}},
 		{name: "选择 I/O 错误", p: &fakePrompter{terminal: true, lines: []string{"demo"}, selectErr: errors.New("terminal input failure")}},
-		{name: "取消读取 key", p: &fakePrompter{terminal: true, lines: []string{"demo", "https://api.example.test", "upstream-model"}, selections: []string{config.Chat, "direct", "finish"}, secretErr: context.Canceled}},
-		{name: "无效 key", p: &fakePrompter{terminal: true, lines: []string{"demo", "https://api.example.test", "upstream-model"}, selections: []string{config.Chat, "direct", "finish"}, secret: "bad key", confirm: true}},
+		{name: "取消读取 key", p: &fakePrompter{terminal: true, lines: []string{"demo", "https://api.example.test", "upstream-model"}, selections: []string{config.AuthAPIKey, config.Chat, "direct", "finish"}, secretErr: context.Canceled}},
+		{name: "无效 key", p: &fakePrompter{terminal: true, lines: []string{"demo", "https://api.example.test", "upstream-model"}, selections: []string{config.AuthAPIKey, config.Chat, "direct", "finish"}, secret: "bad key", confirm: true}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()

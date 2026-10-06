@@ -8,6 +8,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/shichao-wang/cpagw/internal/config"
 	"github.com/shichao-wang/cpagw/internal/connection"
@@ -20,7 +21,7 @@ func newConnectionCommand(open storeFactory, opts Options) *cobra.Command {
 
 func newConnectionCommandWithPrompter(open storeFactory, opts Options, prompter connectionPrompter) *cobra.Command {
 	parent := &cobra.Command{Use: "connection", Short: "管理独立上游连接"}
-	var protocol, baseURL, modelsPath string
+	var protocol, baseURL, modelsPath, authType string
 	var apiKeyStdin bool
 	var modelsValue []config.Model
 	add := &cobra.Command{
@@ -36,11 +37,23 @@ func newConnectionCommandWithPrompter(open storeFactory, opts Options, prompter 
 			if len(args) == 1 {
 				name = args[0]
 			}
+			authExplicit := cmd.Flags().Changed("auth-type")
+			if apiKeyStdin && authType != config.AuthAPIKey {
+				return fmt.Errorf("Codex OAuth 连接不能读取 API key")
+			}
 			if apiKeyStdin && (name == "" || protocol == "" || baseURL == "" || modelsPath == "") {
 				return fmt.Errorf("使用 --api-key-stdin 时必须同时提供 name、--protocol、--base-url 和 --models")
 			}
-			if !p.IsTerminal() && (name == "" || protocol == "" || baseURL == "" || modelsPath == "" || !apiKeyStdin) {
-				return fmt.Errorf("非交互模式必须提供 name、--protocol、--base-url、--models 和 --api-key-stdin")
+			if !p.IsTerminal() {
+				if name == "" || protocol == "" || modelsPath == "" {
+					return fmt.Errorf("非交互模式必须提供 name、--protocol 和 --models；API-key 还必须提供 --api-key-stdin")
+				}
+				if authType == config.AuthAPIKey && (!apiKeyStdin || baseURL == "") {
+					return fmt.Errorf("API-key 非交互模式必须提供 --base-url 和 --api-key-stdin")
+				}
+				if authType == config.AuthCodexOAuth && !authExplicit {
+					return fmt.Errorf("OAuth 非交互模式必须显式提供 --auth-type codex-oauth")
+				}
 			}
 			var err error
 			if name == "" {
@@ -48,6 +61,18 @@ func newConnectionCommandWithPrompter(open storeFactory, opts Options, prompter 
 				if err != nil {
 					return err
 				}
+			}
+			if p.IsTerminal() && !apiKeyStdin && !authExplicit {
+				authType, err = p.Select(cmd.Context(), "选择认证方式", []promptOption{
+					{label: "API key（默认）", value: config.AuthAPIKey},
+					{label: "Codex OAuth", value: config.AuthCodexOAuth},
+				})
+				if err != nil {
+					return err
+				}
+			}
+			if authType != config.AuthAPIKey && authType != config.AuthCodexOAuth {
+				return fmt.Errorf("不支持的认证方式：%s", authType)
 			}
 			if err := config.ValidateName(name); err != nil {
 				return err
@@ -63,14 +88,27 @@ func newConnectionCommandWithPrompter(open storeFactory, opts Options, prompter 
 			if _, exists := state.Connections[name]; exists {
 				return fmt.Errorf("连接已存在：%s", name)
 			}
-			if !apiKeyStdin && p.IsTerminal() {
+			if authType == config.AuthCodexOAuth {
 				if protocol == "" {
+					protocol = config.Responses
+				}
+				if protocol != config.Responses {
+					return fmt.Errorf("Codex OAuth 仅支持 responses 协议")
+				}
+				if baseURL == "" {
+					baseURL = config.CodexBaseURL
+				} else if baseURL != config.CodexBaseURL {
+					return fmt.Errorf("Codex OAuth 必须使用官方 API 地址：%s", config.CodexBaseURL)
+				}
+			}
+			if !apiKeyStdin && p.IsTerminal() {
+				if authType == config.AuthAPIKey && protocol == "" {
 					protocol, err = promptProtocol(cmd.Context(), p)
 					if err != nil {
 						return err
 					}
 				}
-				if baseURL == "" {
+				if authType == config.AuthAPIKey && baseURL == "" {
 					baseURL, err = promptLine(cmd.Context(), p, "API 根地址：", "API 根地址")
 					if err != nil {
 						return err
@@ -95,19 +133,21 @@ func newConnectionCommandWithPrompter(open storeFactory, opts Options, prompter 
 					return err
 				}
 			}
-			c := config.Connection{Name: name, Protocol: protocol, BaseURL: baseURL, Models: models}
+			c := config.Connection{Name: name, AuthType: authType, Protocol: protocol, BaseURL: baseURL, Models: models}
 			if err := connection.ValidateConnection(c); err != nil {
 				return err
 			}
 			key := ""
-			if apiKeyStdin {
-				key, err = apiKey(cmd, true)
-			} else {
-				key, err = p.ReadSecret(cmd.Context(), "API key")
-				if err == nil {
-					key = strings.TrimSpace(key)
-					if err = config.ValidateKey(key); err != nil {
-						return err
+			if authType == config.AuthAPIKey {
+				if apiKeyStdin {
+					key, err = apiKey(cmd, true)
+				} else {
+					key, err = p.ReadSecret(cmd.Context(), "API key")
+					if err == nil {
+						key = strings.TrimSpace(key)
+						if err = config.ValidateKey(key); err != nil {
+							return err
+						}
 					}
 				}
 			}
@@ -115,7 +155,7 @@ func newConnectionCommandWithPrompter(open storeFactory, opts Options, prompter 
 				return sanitizeCredentialError(err)
 			}
 			if p.IsTerminal() && !apiKeyStdin {
-				if _, err := fmt.Fprintf(cmd.OutOrStdout(), "\n连接摘要\n名称：%s\n协议：%s\nAPI 根地址：%s\n模型数：%d\n", c.Name, c.Protocol, c.BaseURL, len(c.Models)); err != nil {
+				if _, err := fmt.Fprintf(cmd.OutOrStdout(), "\n连接摘要\n名称：%s\n认证方式：%s\n协议：%s\nAPI 根地址：%s\n模型数：%d\n", c.Name, c.AuthType, c.Protocol, c.BaseURL, len(c.Models)); err != nil {
 					return err
 				}
 				confirmed, err := p.Confirm(cmd.Context(), "确认保存此连接？")
@@ -139,6 +179,7 @@ func newConnectionCommandWithPrompter(open storeFactory, opts Options, prompter 
 			return err
 		},
 	}
+	add.Flags().StringVar(&authType, "auth-type", config.AuthAPIKey, "认证方式：api-key 或 codex-oauth")
 	add.Flags().StringVar(&protocol, "protocol", "", "chat-completions、anthropic-messages 或 responses")
 	add.Flags().StringVar(&baseURL, "base-url", "", "该协议的 API 根地址")
 	add.Flags().StringVar(&modelsPath, "models", "", "模型清单 YAML 文件")
@@ -161,7 +202,7 @@ func newConnectionCommandWithPrompter(open storeFactory, opts Options, prompter 
 		sort.Strings(names)
 		views := make([]map[string]any, 0, len(names))
 		for _, name := range names {
-			views = append(views, connectionView(state.Connections[name]))
+			views = append(views, connectionView(state, state.Connections[name]))
 		}
 		return json.NewEncoder(cmd.OutOrStdout()).Encode(views)
 	}})
@@ -178,7 +219,7 @@ func newConnectionCommandWithPrompter(open storeFactory, opts Options, prompter 
 		if !ok {
 			return fmt.Errorf("连接不存在：%s", args[0])
 		}
-		return json.NewEncoder(cmd.OutOrStdout()).Encode(connectionView(c))
+		return json.NewEncoder(cmd.OutOrStdout()).Encode(connectionView(state, c))
 	}})
 	var yes bool
 	remove := &cobra.Command{Use: "remove <name>", Short: "删除未被 profile 引用的连接", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
@@ -200,21 +241,44 @@ func newConnectionCommandWithPrompter(open storeFactory, opts Options, prompter 
 	}}
 	remove.Flags().BoolVar(&yes, "yes", false, "确认删除")
 	parent.AddCommand(remove)
+	parent.AddCommand(connectionLoginCommand(open, opts), connectionLogoutCommand(open))
 	parent.AddCommand(connectionDirectoryCommand(open, false), connectionDirectoryCommand(open, true))
 	return parent
 }
 
-func connectionView(c config.Connection) map[string]any {
-	return map[string]any{"name": c.Name, "protocol": c.Protocol, "baseURL": c.BaseURL, "models": c.Models, "credentialConfigured": c.CredentialRef != ""}
+func connectionView(state *config.State, c config.Connection) map[string]any {
+	view := map[string]any{"name": c.Name, "authType": c.AuthType, "protocol": c.Protocol, "baseURL": c.BaseURL, "models": c.Models}
+	if c.AuthType == config.AuthCodexOAuth {
+		status := "not-logged-in"
+		if _, err := state.Credential(c); err == nil {
+			status = "ready"
+		}
+		view["credentialStatus"] = status
+	} else {
+		_, err := state.Key(c)
+		view["credentialConfigured"] = err == nil
+	}
+	return view
 }
 
 func connectionUpdateCommand(open storeFactory, opts Options) *cobra.Command {
-	var baseURL, modelsPath string
+	var baseURL, modelsPath, authType string
 	var apiKeyStdin bool
-	cmd := &cobra.Command{Use: "update <name>", Short: "原子更新地址、模型清单和 key", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+	cmd := &cobra.Command{Use: "update <name>", Short: "原子更新地址、模型清单、认证方式和 key", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		var base *string
 		if cmd.Flags().Changed("base-url") {
 			base = &baseURL
+		}
+		var auth *string
+		if cmd.Flags().Changed("auth-type") {
+			auth = &authType
+			if authType == config.AuthCodexOAuth && base == nil {
+				officialURL := config.CodexBaseURL
+				base = &officialURL
+			}
+			if authType == config.AuthCodexOAuth && apiKeyStdin {
+				return fmt.Errorf("Codex OAuth 不能与 --api-key-stdin 同时使用")
+			}
 		}
 		var models *[]config.Model
 		if cmd.Flags().Changed("models") {
@@ -224,7 +288,7 @@ func connectionUpdateCommand(open storeFactory, opts Options) *cobra.Command {
 			}
 			models = &m
 		}
-		if base == nil && models == nil && !apiKeyStdin {
+		if base == nil && models == nil && !apiKeyStdin && auth == nil {
 			return fmt.Errorf("请指定至少一个更新字段")
 		}
 		if err := config.ValidateName(args[0]); err != nil {
@@ -245,6 +309,9 @@ func connectionUpdateCommand(open storeFactory, opts Options) *cobra.Command {
 		if base != nil {
 			candidate.BaseURL = *base
 		}
+		if auth != nil {
+			candidate.AuthType = *auth
+		}
 		if models != nil {
 			candidate.Models = *models
 		}
@@ -259,7 +326,7 @@ func connectionUpdateCommand(open storeFactory, opts Options) *cobra.Command {
 			}
 			key = &k
 		}
-		if err = connection.Patch(st, args[0], base, models, key); err != nil {
+		if err = connection.Patch(st, args[0], base, models, key, auth); err != nil {
 			return err
 		}
 		if err = notifyChanged(cmd, opts); err != nil {
@@ -268,9 +335,61 @@ func connectionUpdateCommand(open storeFactory, opts Options) *cobra.Command {
 		_, err = fmt.Fprintf(cmd.OutOrStdout(), "已更新连接 %s\n", args[0])
 		return err
 	}}
+	cmd.Flags().StringVar(&authType, "auth-type", "", "显式切换认证方式：api-key 或 codex-oauth")
 	cmd.Flags().StringVar(&baseURL, "base-url", "", "新的 API 根地址")
 	cmd.Flags().StringVar(&modelsPath, "models", "", "新的模型清单 YAML 文件")
 	cmd.Flags().BoolVar(&apiKeyStdin, "api-key-stdin", false, "从标准输入读取新 API key")
+	return cmd
+}
+
+func connectionLoginCommand(open storeFactory, opts Options) *cobra.Command {
+	var noBrowser bool
+	cmd := &cobra.Command{Use: "login <name>", Short: "登录 Codex OAuth 连接", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		if opts.Login == nil {
+			return fmt.Errorf("Codex OAuth 登录器未配置")
+		}
+		st, err := open()
+		if err != nil {
+			return err
+		}
+		session, err := connection.BeginOAuth(st, args[0])
+		if err != nil {
+			return err
+		}
+		defer session.Close()
+		ctx, cancel := context.WithTimeout(cmd.Context(), 15*time.Minute)
+		defer cancel()
+		credential, err := opts.Login(ctx, noBrowser)
+		if err != nil {
+			return err
+		}
+		if err = session.Commit(credential); err != nil {
+			return err
+		}
+		_, err = fmt.Fprintln(cmd.OutOrStdout(), "Codex OAuth 登录完成；凭证仅保存在本机")
+		return err
+	}}
+	cmd.Flags().BoolVar(&noBrowser, "no-browser", false, "不自动打开官方设备授权页面")
+	return cmd
+}
+
+func connectionLogoutCommand(open storeFactory) *cobra.Command {
+	var yes bool
+	cmd := &cobra.Command{Use: "logout <name>", Short: "清除本地 Codex OAuth 凭证", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		if err := confirmRemoval(cmd, yes, args[0]+" 的本地 OAuth 凭证"); err != nil {
+			return err
+		}
+		st, err := open()
+		if err != nil {
+			return err
+		}
+		if err = connection.LogoutOAuth(st, args[0]); err != nil {
+			return err
+		}
+		_, err = fmt.Fprintln(cmd.OutOrStdout(), "本地 OAuth 凭证已清除；未向服务端撤销授权")
+		return err
+	}}
+	cmd.Flags().BoolVar(&yes, "yes", false, "确认清除本地 OAuth 凭证")
 	return cmd
 }
 
@@ -294,6 +413,14 @@ func connectionDirectoryCommand(open storeFactory, check bool) *cobra.Command {
 		}
 		if !check {
 			return json.NewEncoder(cmd.OutOrStdout()).Encode(c.Models)
+		}
+		if c.AuthType == config.AuthCodexOAuth {
+			if _, err := state.Credential(c); err != nil {
+				_, err = fmt.Fprintln(cmd.OutOrStdout(), "Codex OAuth 尚未登录；未发送网络请求")
+				return err
+			}
+			_, err := fmt.Fprintln(cmd.OutOrStdout(), "Codex OAuth 凭证已保存；未请求通用 /models endpoint")
+			return err
 		}
 		key, err := state.Key(c)
 		if err != nil {

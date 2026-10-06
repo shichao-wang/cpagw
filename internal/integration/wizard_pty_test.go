@@ -40,12 +40,13 @@ func TestWizardTerminal(t *testing.T) {
 		input string
 	}{
 		{title: "连接名称", input: "terminal-test\r"},
+		{title: "选择认证方式", input: "\r"},
 		{title: "上游协议", input: "\x1b[B\r"},
 		{title: "API 根地址", input: "https://example.invalid\r"},
 		{title: "模型来源", input: "\r"},
 		{title: "模型 ID", input: "upstream-model=终端测试模型\r"},
 		{title: "模型录入（", input: "\r"},
-		{title: "API key", input: wizardTestKey + "\r"},
+		{title: "API key（Enter", input: wizardTestKey + "\r"},
 		{title: "确认保存此连接", input: "\x1b[B\r"},
 	}
 
@@ -81,7 +82,7 @@ func TestWizardTerminal(t *testing.T) {
 			dir, before := newState(t)
 			terminal := startWizardTerminal(t, binary, dir)
 			advance(t, terminal, stage)
-			if stage == 6 {
+			if stage == 7 {
 				terminal.send(t, wizardTestKey)
 			}
 			terminal.send(t, "\x03")
@@ -93,12 +94,12 @@ func TestWizardTerminal(t *testing.T) {
 	}
 
 	for _, signal := range []syscall.Signal{syscall.SIGINT, syscall.SIGTERM} {
-		for _, stage := range []int{0, 1, 6} {
+		for _, stage := range []int{0, 1, 2, 7} {
 			t.Run(signal.String()+"/"+steps[stage].title, func(t *testing.T) {
 				dir, before := newState(t)
 				terminal := startWizardTerminal(t, binary, dir)
 				advance(t, terminal, stage)
-				if stage == 6 {
+				if stage == 7 {
 					terminal.send(t, wizardTestKey)
 				}
 				if err := terminal.cmd.Process.Signal(signal); err != nil {

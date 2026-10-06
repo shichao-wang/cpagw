@@ -23,7 +23,7 @@ func testStore(t *testing.T) *store.Store {
 		state.Secrets["secret-b"] = "token-b"
 		state.Secrets["upstream-secret"] = "upstream-token"
 		state.Connections["mock"] = config.Connection{
-			Name: "mock", Protocol: config.Anthropic, BaseURL: "https://example.com",
+			ID: "connection-mock", Name: "mock", AuthType: config.AuthAPIKey, Protocol: config.Anthropic, BaseURL: "https://example.com",
 			CredentialRef: "upstream-secret",
 			Models:        []config.Model{{ID: "target-opus"}, {ID: "target-sonnet"}, {ID: "target-haiku"}},
 		}
@@ -48,7 +48,7 @@ func testProfile(name, id, keyRef, prefix string) config.Profile {
 			Description: "description for " + prefix + " " + slot,
 		}
 	}
-	return config.Profile{Name: name, ID: id, KeyRef: keyRef, Models: models}
+	return config.Profile{Name: name, ID: id, Agent: "claude-code", KeyRef: keyRef, Models: models}
 }
 
 func writeDoc(t *testing.T, path string, value any, mode os.FileMode) {

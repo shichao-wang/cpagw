@@ -131,8 +131,8 @@ func TestGatewayRoutesByProfileAndUpstreamProtocol(t *testing.T) {
 	state := testState(listen, chatA.URL, chatB.URL, anthropic.URL, responses.URL)
 	state.Secrets["anthropic-b"] = "anthropic-key-b"
 	state.Secrets["responses-b"] = "responses-key-b"
-	state.Connections["anthropic-b"] = config.Connection{Name: "anthropic-b", Protocol: config.Anthropic, BaseURL: anthropicB.URL, CredentialRef: "anthropic-b", Models: []config.Model{{ID: "anthropic-target", Name: "Anthropic target"}}}
-	state.Connections["responses-b"] = config.Connection{Name: "responses-b", Protocol: config.Responses, BaseURL: responsesB.URL, CredentialRef: "responses-b", Models: []config.Model{{ID: "responses-target", Name: "Responses target"}}}
+	state.Connections["anthropic-b"] = config.Connection{ID: "anthropic-b-id", Name: "anthropic-b", AuthType: config.AuthAPIKey, Protocol: config.Anthropic, BaseURL: anthropicB.URL, CredentialRef: "anthropic-b", Models: []config.Model{{ID: "anthropic-target", Name: "Anthropic target"}}}
+	state.Connections["responses-b"] = config.Connection{ID: "responses-b-id", Name: "responses-b", AuthType: config.AuthAPIKey, Protocol: config.Responses, BaseURL: responsesB.URL, CredentialRef: "responses-b", Models: []config.Model{{ID: "responses-target", Name: "Responses target"}}}
 	beta := state.Profiles["beta"]
 	sonnet := beta.Models["sonnet"]
 	sonnet.Connection = "anthropic-b"
@@ -297,10 +297,10 @@ func testState(listen, chatA, chatB, anthropic, responses string) *config.State 
 	anthropicModels := []config.Model{{ID: "anthropic-target", Name: "Anthropic target"}}
 	responsesModels := []config.Model{{ID: "responses-target", Name: "Responses target"}}
 	state.Connections = map[string]config.Connection{
-		"chat-a":    {Name: "chat-a", Protocol: config.Chat, BaseURL: chatA, CredentialRef: "chat-a", Models: shared},
-		"chat-b":    {Name: "chat-b", Protocol: config.Chat, BaseURL: chatB, CredentialRef: "chat-b", Models: shared},
-		"anthropic": {Name: "anthropic", Protocol: config.Anthropic, BaseURL: anthropic, CredentialRef: "anthropic", Models: anthropicModels},
-		"responses": {Name: "responses", Protocol: config.Responses, BaseURL: responses, CredentialRef: "responses", Models: responsesModels},
+		"chat-a":    {ID: "chat-a-id", Name: "chat-a", AuthType: config.AuthAPIKey, Protocol: config.Chat, BaseURL: chatA, CredentialRef: "chat-a", Models: shared},
+		"chat-b":    {ID: "chat-b-id", Name: "chat-b", AuthType: config.AuthAPIKey, Protocol: config.Chat, BaseURL: chatB, CredentialRef: "chat-b", Models: shared},
+		"anthropic": {ID: "anthropic-id", Name: "anthropic", AuthType: config.AuthAPIKey, Protocol: config.Anthropic, BaseURL: anthropic, CredentialRef: "anthropic", Models: anthropicModels},
+		"responses": {ID: "responses-id", Name: "responses", AuthType: config.AuthAPIKey, Protocol: config.Responses, BaseURL: responses, CredentialRef: "responses", Models: responsesModels},
 	}
 	state.Profiles = map[string]config.Profile{
 		"alpha": {
@@ -332,8 +332,8 @@ func TestConnectionsWithSameEndpointAndKeyKeepDistinctIdentity(t *testing.T) {
 	state.Secrets["upstream"] = "same-upstream-key"
 	state.Secrets["profile"] = "profile-client-key"
 	models := []config.Model{{ID: "shared-model", Name: "Shared model"}}
-	state.Connections["same-a"] = config.Connection{Name: "same-a", Protocol: config.Chat, BaseURL: "https://example.com", CredentialRef: "upstream", Models: models}
-	state.Connections["same-b"] = config.Connection{Name: "same-b", Protocol: config.Chat, BaseURL: "https://example.com", CredentialRef: "upstream", Models: models}
+	state.Connections["same-a"] = config.Connection{ID: "same-a-id", Name: "same-a", AuthType: config.AuthAPIKey, Protocol: config.Chat, BaseURL: "https://example.com", CredentialRef: "upstream", Models: models}
+	state.Connections["same-b"] = config.Connection{ID: "same-b-id", Name: "same-b", AuthType: config.AuthAPIKey, Protocol: config.Chat, BaseURL: "https://example.com", CredentialRef: "upstream", Models: models}
 	state.Profiles["alpha"] = config.Profile{
 		Name: "alpha", ID: "profile-alpha", Agent: "claude-code", KeyRef: "profile",
 		Models: map[string]config.Binding{
@@ -394,8 +394,12 @@ func waitForReady(t *testing.T, st *store.Store) RuntimeState {
 			request.Header.Set(probeHeader, runtimeState.ProbeToken)
 			response, err := client.Do(request)
 			if err == nil {
+				var payload struct {
+					Ready bool `json:"ready"`
+				}
+				decodeErr := json.NewDecoder(response.Body).Decode(&payload)
 				_ = response.Body.Close()
-				if response.StatusCode == http.StatusOK {
+				if response.StatusCode == http.StatusOK && decodeErr == nil && payload.Ready {
 					return runtimeState
 				}
 			}

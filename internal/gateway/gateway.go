@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,20 +22,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gin-gonic/gin"
-	sdkapi "github.com/router-for-me/CLIProxyAPI/v8/sdk/api"
-	sdkhandlers "github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
-	cliproxy "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 	"github.com/shichao-wang/cpagw/internal/config"
 	"github.com/shichao-wang/cpagw/internal/store"
-	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v3"
 )
 
 const (
 	RuntimeFileName = "runtime.json"
-	RunLockFileName = ".gateway.lock"
+	RunLockFileName = store.RunLockFileName
 	ReadyPath       = "/__cpagw/ready"
 	probeHeader     = "X-CPAGW-Instance-Token"
 )
@@ -59,6 +55,9 @@ type modelRoute struct {
 	prefix      string
 	label       string
 	description string
+	authID      string
+	authType    string
+	unavailable string
 }
 
 type profileSnapshot struct {
@@ -69,14 +68,15 @@ type profileSnapshot struct {
 }
 
 type snapshot struct {
-	revision uint64
-	profiles map[string]profileSnapshot
-	keyIndex map[[32]byte]string
-	sdkKey   string
-	config   *sdkconfig.Config
+	revision    uint64
+	profiles    map[string]profileSnapshot
+	keyIndex    map[[32]byte]string
+	sdkKey      string
+	config      *sdkconfig.Config
+	connections []connectionInfo
 }
 
-// Run 在当前进程以前台方式运行代理，并在状态修订变更时重建 SDK 服务。
+// Run 在当前进程运行单个 SDK 服务，状态修订变更通过受管热更新生效。
 func Run(ctx context.Context, st *store.Store, instanceID string) error {
 	if st == nil {
 		return fmt.Errorf("状态存储不能为空")
@@ -90,7 +90,7 @@ func Run(ctx context.Context, st *store.Store, instanceID string) error {
 	ctx, stopSignals := signalContext(ctx)
 	defer stopSignals()
 
-	lock, err := acquireRunLock(st.Path(RunLockFileName))
+	lock, err := st.AcquireRunLock()
 	if err != nil {
 		return err
 	}
@@ -140,60 +140,11 @@ func Run(ctx context.Context, st *store.Store, instanceID string) error {
 		return err
 	}
 
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := persistSDKConfig(st, initial.config); err != nil {
-			return err
-		}
-		if err := runRevision(ctx, st, listen, probeToken, &active, initial, &runtimeState, &runtimeMu); err != nil {
-			if errors.Is(err, context.Canceled) && ctx.Err() != nil {
-				return ctx.Err()
-			}
-			return err
-		}
-
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		runtimeState.Ready = false
-		runtimeState.ActiveRevision = 0
-		runtimeState.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
-		if err := writeRuntime(st, runtimeState); err != nil {
-			return err
-		}
-		nextState, err := st.Read()
-		if err != nil {
-			return err
-		}
-		if nextState.Revision == initial.revision {
-			// SDK 服务异常退出但配置未变化，不自动无限重启。
-			return fmt.Errorf("代理服务意外停止，配置修订仍为 %d", initial.revision)
-		}
-		listen, err = normalizeListen(nextState.Listen)
-		if err != nil {
-			runtimeState.Error = err.Error()
-			_ = writeRuntime(st, runtimeState)
-			return err
-		}
-		runtimeState.Listen = listen
-		next, err := compile(nextState, st)
-		if err != nil {
-			runtimeState.Ready = false
-			runtimeState.Error = err.Error()
-			runtimeState.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
-			_ = writeRuntime(st, runtimeState)
-			return err
-		}
-		runtimeState.Ready = false
-		runtimeState.Error = ""
-		runtimeState.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
-		if err := writeRuntime(st, runtimeState); err != nil {
-			return err
-		}
-		initial = next
+	err = runManagedService(ctx, st, listen, probeToken, &active, initial, &runtimeState, &runtimeMu, runtimeOptions{})
+	if err != nil && !errors.Is(err, context.Canceled) {
+		runtimeState.Error = err.Error()
 	}
+	return err
 }
 
 func signalContext(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -214,131 +165,6 @@ func normalizeListen(raw string) (string, error) {
 		return "", fmt.Errorf("监听端口必须在 1–65535 之间")
 	}
 	return net.JoinHostPort(host, portText), nil
-}
-
-func runRevision(ctx context.Context, st *store.Store, listen, token string, active *atomic.Pointer[snapshot], cfg *snapshot, runtimeState *RuntimeState, runtimeMu *sync.Mutex) error {
-	host, portText, err := net.SplitHostPort(listen)
-	if err != nil {
-		return err
-	}
-	port, err := strconv.Atoi(portText)
-	if err != nil {
-		return fmt.Errorf("监听端口无效")
-	}
-	gate := &requestGate{store: st, active: active, token: token, instanceID: runtimeState.InstanceID}
-	var startupErr error
-	runCtx, cancel := context.WithCancel(ctx)
-	serviceConfig := cfg.config
-	serviceConfig.Host = host
-	serviceConfig.Port = port
-
-	service, err := cliproxy.NewBuilder().
-		WithConfig(serviceConfig).
-		WithConfigPath(st.Path("sdk-runtime.yaml")).
-		WithWatcherFactory(func(string, string, func(*sdkconfig.Config)) (*cliproxy.WatcherWrapper, error) {
-			// 网关只以状态文件为事实源；SDK 的文件 watcher 不允许反向改变运行配置。
-			return &cliproxy.WatcherWrapper{}, nil
-		}).
-		WithHooks(cliproxy.Hooks{OnAfterStart: func(*cliproxy.Service) {
-			active.Store(cfg)
-			if err := probeStartup(runCtx, listen, token, runtimeState.InstanceID, cfg.revision); err != nil {
-				active.Store(nil)
-				startupErr = err
-				cancel()
-				return
-			}
-			gate.ready.Store(true)
-			runtimeMu.Lock()
-			runtimeState.Ready = true
-			runtimeState.ActiveRevision = cfg.revision
-			runtimeState.Error = ""
-			runtimeState.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
-			if err := writeRuntime(st, *runtimeState); err != nil {
-				gate.ready.Store(false)
-				active.Store(nil)
-				runtimeState.Ready = false
-				startupErr = err
-				runtimeMu.Unlock()
-				cancel()
-				return
-			}
-			runtimeMu.Unlock()
-			gate.ready.Store(true)
-		}}).
-		WithServerOptions(
-			sdkapi.WithMiddleware(gate.middleware()),
-			sdkapi.WithRouterConfigurator(func(engine *gin.Engine, _ *sdkhandlers.BaseAPIHandler, _ *sdkconfig.Config) {
-				engine.GET(ReadyPath, func(c *gin.Context) {
-					current := active.Load()
-					if current == nil {
-						c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"ready": false})
-						return
-					}
-					c.JSON(http.StatusOK, gin.H{
-						"ready": gate.ready.Load(), "instanceID": runtimeState.InstanceID,
-						"revision": current.revision, "activeRevision": current.revision,
-					})
-				})
-			}),
-		).Build()
-	if err != nil {
-		cancel()
-		return fmt.Errorf("初始化上游 SDK 失败：%w", err)
-	}
-
-	serviceDone := make(chan error, 1)
-	go func() { serviceDone <- service.Run(runCtx) }()
-	ticker := time.NewTicker(250 * time.Millisecond)
-	defer ticker.Stop()
-	defer cancel()
-	for {
-		select {
-		case err := <-serviceDone:
-			gate.ready.Store(false)
-			active.Store(nil)
-			if startupErr != nil {
-				return startupErr
-			}
-			return err
-		case <-ctx.Done():
-			gate.ready.Store(false)
-			active.Store(nil)
-			cancel()
-			select {
-			case <-serviceDone:
-			case <-time.After(35 * time.Second):
-				return fmt.Errorf("等待代理服务关闭超时")
-			}
-			return ctx.Err()
-		case <-ticker.C:
-			latest, err := st.Read()
-			if err != nil {
-				gate.ready.Store(false)
-				active.Store(nil)
-				cancel()
-				<-serviceDone
-				return err
-			}
-			if latest.Revision != cfg.revision {
-				gate.ready.Store(false)
-				active.Store(nil)
-				runtimeMu.Lock()
-				runtimeState.Ready = false
-				runtimeState.ActiveRevision = 0
-				runtimeState.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
-				err := writeRuntime(st, *runtimeState)
-				runtimeMu.Unlock()
-				if err != nil {
-					cancel()
-					<-serviceDone
-					return err
-				}
-				cancel()
-				<-serviceDone
-				return nil
-			}
-		}
-	}
 }
 
 func probeStartup(ctx context.Context, listen, token, instanceID string, revision uint64) error {
@@ -420,6 +246,41 @@ func compile(state *config.State, st *store.Store) (*snapshot, error) {
 	usedIDs := map[string]struct{}{}
 	usedKeys := map[[32]byte]string{}
 	connections := map[string]connectionInfo{}
+	var connectionKeys []string
+	for cname, connection := range state.Connections {
+		{
+			info := connectionInfo{name: cname, id: connection.ID, authType: connection.AuthType,
+				credentialRef: connection.CredentialRef, prefix: config.ConnectionPrefix(cname),
+				protocol: connection.Protocol, baseURL: connection.BaseURL, models: connection.Models}
+			switch connection.AuthType {
+			case config.AuthAPIKey:
+				info.apiKey, err = state.Key(connection)
+				if err != nil {
+					// 未被 profile 使用的待配置连接不进入 SDK，也不影响其他连接。
+					if len(state.References(cname, "")) == 0 {
+						continue
+					}
+					return nil, err
+				}
+			case config.AuthCodexOAuth:
+			default:
+				return nil, fmt.Errorf("连接必须显式声明有效的认证方式")
+			}
+			key := cname
+			connections[key] = info
+			connectionKeys = append(connectionKeys, key)
+		}
+	}
+	sort.Strings(connectionKeys)
+	for _, key := range connectionKeys {
+		info := connections[key]
+		out.connections = append(out.connections, info)
+		if info.authType == config.AuthAPIKey {
+			if err := appendSDKConnection(cfg, info, info.models); err != nil {
+				return nil, err
+			}
+		}
+	}
 	for name, profile := range state.Profiles {
 		if strings.TrimSpace(profile.ID) == "" {
 			return nil, fmt.Errorf("profile %s 缺少 ID", name)
@@ -428,7 +289,7 @@ func compile(state *config.State, st *store.Store) (*snapshot, error) {
 			return nil, fmt.Errorf("profile ID 重复：%s", profile.ID)
 		}
 		usedIDs[profile.ID] = struct{}{}
-		if err := state.ValidateProfile(profile); err != nil {
+		if err := state.ValidateProfileStructure(profile); err != nil {
 			return nil, fmt.Errorf("profile %s 无效：%w", name, err)
 		}
 		if strings.TrimSpace(profile.KeyRef) == "" || strings.TrimSpace(state.Secrets[profile.KeyRef]) == "" {
@@ -443,25 +304,11 @@ func compile(state *config.State, st *store.Store) (*snapshot, error) {
 		ps := profileSnapshot{name: name, id: profile.ID, models: make(map[string]modelRoute, len(profile.Models))}
 		for _, slot := range config.Slots {
 			binding := profile.Models[slot]
-			connection := state.Connections[binding.Connection]
-			connectionKey := binding.Connection
-			info, exists := connections[connectionKey]
-			if !exists {
-				prefix := uniquePrefix(binding.Connection)
-				info = connectionInfo{name: binding.Connection, prefix: prefix, protocol: connection.Protocol, baseURL: connection.BaseURL}
-				info.apiKey, err = state.Key(connection)
-				if err != nil {
-					return nil, err
-				}
-				connections[connectionKey] = info
-				if err := appendSDKConnection(cfg, info, connection.Models); err != nil {
-					return nil, err
-				}
-			}
+			info := connections[binding.Connection]
 			route := modelRoute{
 				publicID: binding.PublicModel, targetModel: binding.TargetModel,
 				sdkModel: info.prefix + "/" + binding.TargetModel, prefix: info.prefix,
-				label: binding.Label, description: binding.Description,
+				label: binding.Label, description: binding.Description, authType: info.authType,
 			}
 			ps.models[route.publicID] = route
 			ps.catalog = append(ps.catalog, route)
@@ -473,11 +320,15 @@ func compile(state *config.State, st *store.Store) (*snapshot, error) {
 }
 
 type connectionInfo struct {
-	name     string
-	prefix   string
-	protocol string
-	baseURL  string
-	apiKey   string
+	name          string
+	prefix        string
+	protocol      string
+	baseURL       string
+	apiKey        string
+	id            string
+	authType      string
+	credentialRef string
+	models        []config.Model
 }
 
 func appendSDKConnection(cfg *sdkconfig.Config, info connectionInfo, models []config.Model) error {
@@ -516,11 +367,6 @@ func appendSDKConnection(cfg *sdkconfig.Config, info connectionInfo, models []co
 	return nil
 }
 
-func uniquePrefix(connection string) string {
-	sum := sha256.Sum256([]byte(connection))
-	return "cpagw-" + hex.EncodeToString(sum[:8])
-}
-
 func persistSDKConfig(st *store.Store, cfg *sdkconfig.Config) error {
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
@@ -548,25 +394,6 @@ func randomHex(size int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(data), nil
-}
-
-func acquireRunLock(path string) (*os.File, error) {
-	if err := store.CheckFile(path); err != nil {
-		return nil, err
-	}
-	fd, err := unix.Open(path, unix.O_CREAT|unix.O_RDWR|unix.O_NOFOLLOW, 0600)
-	if err != nil {
-		return nil, fmt.Errorf("打开网关进程锁失败：%w", err)
-	}
-	file := os.NewFile(uintptr(fd), path)
-	if err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		_ = file.Close()
-		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
-			return nil, fmt.Errorf("网关实例已在运行")
-		}
-		return nil, fmt.Errorf("获取网关进程锁失败：%w", err)
-	}
-	return file, nil
 }
 
 func secureEqual(a, b string) bool {

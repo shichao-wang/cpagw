@@ -64,6 +64,33 @@ func TestInvalidStateDoesNotOverwrite(t *testing.T) {
 		t.Fatal("损坏文件被覆盖")
 	}
 }
+func TestLegacyStateShapesAreRejectedWithoutOverwrite(t *testing.T) {
+	fixtures := [][]byte{
+		[]byte(`{"schemaVersion":1,"listen":"127.0.0.1:8317","providers":{},"profiles":{},"secrets":{}}`),
+		[]byte(`{"schemaVersion":2,"listen":"127.0.0.1:8317","connections":{},"profiles":{},"secrets":{}}`),
+		[]byte(`{"schemaVersion":2,"listen":"127.0.0.1:8317","providers":{},"profiles":{},"secrets":{},"oauthCredentials":{}}`),
+	}
+	for _, fixture := range fixtures {
+		s := testStore(t)
+		if err := AtomicWrite(s.Path("state.json"), fixture); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Read(); err == nil {
+			t.Fatalf("旧状态应拒绝：%s", fixture)
+		}
+		if err := s.Update(func(*config.State) error { return nil }); err == nil {
+			t.Fatalf("旧状态更新应拒绝：%s", fixture)
+		}
+		got, err := os.ReadFile(s.Path("state.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != string(fixture) {
+			t.Fatal("被拒绝的旧状态文件内容不得改变")
+		}
+	}
+}
+
 func TestSymlinkRejected(t *testing.T) {
 	s := testStore(t)
 	target := filepath.Join(t.TempDir(), "target")

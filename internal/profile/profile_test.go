@@ -166,7 +166,8 @@ func seedConnection(st *store.Store) error {
 	return st.Update(func(s *config.State) error {
 		s.Secrets["test-key"] = "upstream-key"
 		s.Connections["default"] = config.Connection{
-			Name: "default", Protocol: config.Chat, BaseURL: "https://api.example.test", CredentialRef: "test-key",
+			ID: "profile-test-connection", AuthType: config.AuthAPIKey, Name: "default", Protocol: config.Chat,
+			BaseURL: "https://api.example.test", CredentialRef: "test-key",
 			Models: []config.Model{{ID: "model-a"}, {ID: "model-b"}},
 		}
 		return nil

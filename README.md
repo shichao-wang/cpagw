@@ -5,13 +5,13 @@
 ## 配置模型
 
 ```text
-connection：独立上游连接（协议、API 根地址、自己的 API key、模型清单）
+connection：独立上游连接（稳定 ID、协议、认证方式、API 根地址、专属凭证、模型清单）
 profile：下游 Agent 的专属 key、三档 connection/实际模型绑定与展示
 ```
 
 接入只需创建一个 connection，不需要先创建 provider。每个连接独立选择协议和凭证，名称不决定协议。每个 profile 的 Opus、Sonnet、Haiku 档位直接选择 connection 和实际模型 ID；多个档位可以使用同一连接。
 
-**这是不兼容旧配置的结构调整。** 当前只支持 schema 2，不保留 `provider` 命令、旧 profile 的 `provider` 字段或 schema 1 转换。旧状态会明确报错，且不会被覆盖。已有配置的用户应先用原版本执行 restore、停止旧服务，再用新的 `--state-dir` 重新接入；不要让旧、新版本共享状态目录。
+**这是不兼容旧配置的结构调整。** 当前只支持 schema 3，不保留 `provider` 命令、旧 profile 的 `provider` 字段或旧状态迁移。schema 1，以及旧 provider 版和独立 API-key 版 schema 2，均明确拒绝且不会被覆盖。已有配置的用户应先用原版本执行 restore、停止旧服务，再用新的 `--state-dir` 重新接入；OAuth 连接需要重新登录。不要让旧、新版本共享状态目录。
 
 下游公开模型 ID 保持为 Claude ID。不同 profile 可以使用相同公开 ID，但展示不同名称并路由到不同上游。
 
@@ -81,7 +81,7 @@ cpagw connection add
 # 也可以先指定名称：cpagw connection add example
 ```
 
-向导依次收集连接名称、协议、API 根地址、模型清单和隐藏输入的 key，确认后一次保存。协议、模型来源、继续添加模型和最终确认均使用 **↑/↓ 选择、Enter 确认**，不需要输入数字编号或 `y/n`；保存和删除确认默认选中“取消”。直接录入模型时，每条使用 `ID` 或 `ID=展示名`，之后选择“继续添加模型”或“完成录入”；也可以选择 YAML 文件，不必先创建文件。
+向导依次收集连接名称、认证方式、协议、API 根地址、模型清单和凭证信息，确认后一次保存。API-key 连接使用隐藏输入；Codex OAuth 连接不询问 key，创建后单独登录。认证方式、协议、模型来源、继续添加模型和最终确认均使用 **↑/↓ 选择、Enter 确认**，不需要输入数字编号或 `y/n`；保存和删除确认默认选中“取消”。直接录入模型时，每条使用 `ID` 或 `ID=展示名`，之后选择“继续添加模型”或“完成录入”；也可以选择 YAML 文件，不必先创建文件。
 
 在文本、选择菜单、密码和确认阶段都可按 **Control+C** 取消；命令提示“已取消”，以退出码 130 返回 shell 并恢复终端。保存前（包括等待状态锁时）取消不会保存连接、凭证或增加 revision；原子提交开始后不保证撤回，保存成功后的重载失败仍会明确报告已保存。添加默认不联网、不发模型请求。
 
@@ -111,7 +111,37 @@ cpagw connection models example
 cpagw connection check example
 ```
 
-非交互模式必须提供完整参数和 `--api-key-stdin`，缺参会报错而不会等待向导。每个连接持有自己的 key，不存在继承或隐藏的 provider。show/list 不回显 key 或凭证引用。
+API-key 非交互接入必须提供完整参数和 `--api-key-stdin`；OAuth 非交互接入显式指定 `--auth-type codex-oauth`、`--protocol responses` 和模型清单，不提供 API key。缺参会报错而不会等待向导。每个连接持有自己的凭证，不存在默认 key 继承或隐藏的 provider。show/list 仅显示认证方式与凭证就绪状态，不回显 key、token、凭证引用或账户标识。
+
+### Codex OAuth
+
+Codex OAuth 目前只支持 `responses` 协议和 OpenAI 官方 Codex endpoint `https://chatgpt.com/backend-api/codex`。可省略 `--base-url`，也可显式指定这个官方地址；不支持自定义 OAuth endpoint。认证通过 Codex 的设备码流程完成：命令输出官方验证页和设备码，用户在浏览器中完成授权，CLI 等待授权结果。可用 `--no-browser` 禁止 CLI 尝试打开浏览器。
+
+为 Codex OAuth 准备独立的 `codex-models.yaml`，不要复用上面 API key 示例的模型清单：
+
+```yaml
+models:
+  - id: gpt-5.5
+    name: Codex 示例模型
+```
+
+`gpt-5.5` 仅为示例，使用前请确认自己的账号实际支持该模型，并据此填写模型清单与 profile 绑定。
+
+```sh
+cpagw connection add codex \
+  --auth-type codex-oauth \
+  --protocol responses \
+  --models codex-models.yaml
+cpagw connection login codex --no-browser
+# bindings.yaml 的 opus/sonnet/haiku 均设置 connection: codex、target_model: gpt-5.5
+cpagw profile create codex --agent claude-code --file bindings.yaml
+cpagw server start
+cpagw profile apply codex
+cpagw server stop
+cpagw connection logout codex --yes
+```
+
+认证方式切换必须在 `connection update` 中显式传 `--auth-type`；切换为 API key 时还需在同一命令显式提供 `--api-key-stdin`，不能继承或回退。新增 OAuth 连接、`login`、`logout`、重登录、认证类型切换及删除 OAuth 连接，均要求先停止网关；API-key 连接仍支持热更新。连接保留，logout 只清除本地保存的 OAuth 凭证，不代表向上游撤销授权。OAuth 凭证属于本地敏感状态，可能以明文保存但文件权限限制为 0600；请勿提交或分享状态文件。OAuth 账号可用模型取决于账号实际授权及 SDK 注册目录；模型清单只是本地声明，不保证账号支持该模型，也不意味着任意 Responses 服务兼容。OAuth 检查不会携带 access token 请求通用 `/models` endpoint。
 
 上游协议：
 
@@ -162,12 +192,13 @@ cpagw profile delete daily
 ## 本地状态与安全
 
 - 状态目录默认为 `$XDG_CONFIG_HOME/cpagw`，未设置时使用 `~/.config/cpagw`；可用 `--state-dir` 隔离。
-- 状态目录 0700、敏感文件 0600；配置、secret 引用及 secret 数据以同一原子事务保存。上游 key 和下游 profile key 分开引用，SDK 配置是私有派生数据。
+- 状态目录 0700、敏感文件 0600；配置、secret 引用及 secret 数据以同一原子事务保存。上游 key、Codex OAuth 凭证和下游 profile key 分开管理，SDK 配置是私有派生数据。
+- 当前状态格式为 schema 3，仅接受显式认证方式、稳定连接 ID 与独立 OAuth 表的完整新格式；不存在 `state migrate` 或自动默认化。旧 schema 1/2 及 provider 结构会拒绝读取/覆盖，使用新状态目录重新配置，OAuth 连接重新登录。
 - 本地状态和 Claude Code 应用后的 settings 都可能含明文 key；文件权限保护不是加密保险箱。不要提交或分享这些文件。
 - 默认仅监听 loopback；后台和前台启动都会预检查监听地址，端口冲突时明确报告占用地址，不启动网关，也不停止原占用服务。预检查分两步：先探测同端口的 `127.0.0.1` 与 `::1` 是否已有服务监听，再验证地址可绑定。**只做绑定检查并不足够**——macOS 允许通配监听（如 `*:8317`）与具体 loopback 地址同时绑成功，绑定成功不能证明端口空闲。预检查会立即释放临时监听器，正式监听和实例就绪校验仍负责处理之后的端口竞争。
 - 下游只开放模型列表、Messages 及支持的 count_tokens，其他执行协议及管理入口不向 profile key 开放。
 - 模型目录隐藏不是唯一的访问控制：每次推理也严格校验 key 和公开模型绑定。
-- 当前配置更新通过网关进程内重建 SDK 服务生效，可能短暂不可用，并中断在途请求；CLI 会确认新 revision 就绪后才报告成功。SDK watcher 无中断重载是后续优化项。
+- 本地状态是配置与 OAuth 凭证的唯一事实源，SDK 配置和认证记录均为派生运行时数据。网关进程使用单个 SDK Service；结构变更在该 Service 上串行热更新，关闭请求 gate 直至新状态就绪后再报告成功。OAuth token 刷新仅做凭证条件保存，不触发结构重载；登录、退出和认证方式切换仍要求先停止网关。
 - stop 不承诺等待全部在途 SSE 完整结束。
 
 ## 验证
