@@ -146,8 +146,53 @@ func TestGatewayRoutesByProfileAndUpstreamProtocol(t *testing.T) {
 
 	client := &http.Client{Timeout: 8 * time.Second, Transport: &http.Transport{Proxy: nil}}
 	defer client.CloseIdleConnections()
-	assertCatalog(t, client, listen, "alpha-client-secret", "alpha")
-	assertCatalog(t, client, listen, "beta-client-secret", "beta")
+	for _, header := range []string{"X-Api-Key", "Authorization"} {
+		t.Run("catalog/"+header, func(t *testing.T) {
+			assertCatalog(t, client, listen, header, "alpha-client-secret", "alpha")
+			assertCatalog(t, client, listen, header, "beta-client-secret", "beta")
+		})
+	}
+	for _, test := range []struct {
+		name   string
+		apiKey string
+		bearer string
+	}{
+		{name: "missing"},
+		{name: "invalid-api-key", apiKey: "invalid-client-secret"},
+		{name: "invalid-bearer", bearer: "invalid-client-secret"},
+		{name: "conflicting", apiKey: "alpha-client-secret", bearer: "beta-client-secret"},
+	} {
+		t.Run("catalog/auth/"+test.name, func(t *testing.T) {
+			request, err := http.NewRequest(http.MethodGet, "http://"+listen+"/v1/models", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.apiKey != "" {
+				request.Header.Set("X-Api-Key", test.apiKey)
+			}
+			if test.bearer != "" {
+				request.Header.Set("Authorization", "Bearer "+test.bearer)
+			}
+			response := mustDo(t, client, request)
+			defer response.Body.Close()
+			data, err := io.ReadAll(response.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var payload struct {
+				Error struct {
+					Type string `json:"type"`
+				} `json:"error"`
+				Data json.RawMessage `json:"data"`
+			}
+			if err := json.Unmarshal(data, &payload); err != nil {
+				t.Fatalf("鉴权错误必须是单个 JSON：%v", err)
+			}
+			if response.StatusCode != http.StatusUnauthorized || payload.Error.Type != "authentication_error" || payload.Data != nil {
+				t.Fatalf("无效目录凭证未被拒绝：status=%d, payload=%+v", response.StatusCode, payload)
+			}
+		})
+	}
 
 	for _, test := range []struct {
 		profile string
@@ -303,13 +348,16 @@ func waitForReady(t *testing.T, st *store.Store) RuntimeState {
 	}
 }
 
-func assertCatalog(t *testing.T, client *http.Client, listen, key, profilePrefix string) {
+func assertCatalog(t *testing.T, client *http.Client, listen, header, key, profilePrefix string) {
 	t.Helper()
 	request, err := http.NewRequest(http.MethodGet, "http://"+listen+"/v1/models", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	request.Header.Set("X-Api-Key", key)
+	if header == "Authorization" {
+		key = "Bearer " + key
+	}
+	request.Header.Set(header, key)
 	response, err := client.Do(request)
 	if err != nil {
 		t.Fatal(err)
@@ -326,8 +374,13 @@ func assertCatalog(t *testing.T, client *http.Client, listen, key, profilePrefix
 			Description string `json:"description"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+	data, err := io.ReadAll(response.Body)
+	if err != nil {
 		t.Fatal(err)
+	}
+	// 校验完整响应，避免只解析首个 JSON 而漏掉后续 handler 追加的内容。
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatalf("模型目录必须是单个 JSON：%v", err)
 	}
 	if len(payload.Data) != 3 {
 		t.Fatalf("catalog returned %d models, want exactly 3", len(payload.Data))
