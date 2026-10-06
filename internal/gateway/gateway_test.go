@@ -232,14 +232,14 @@ func testState(listen, chatA, chatB, anthropic, responses string) *config.State 
 	responsesModels := []config.Model{{ID: "responses-target", Name: "Responses target"}}
 	state.Providers = map[string]config.Provider{
 		"chat-provider": {Name: "Chat", Connections: map[string]config.Connection{
-			"connection-a": {Name: "connection-a", Protocol: config.Chat, BaseURL: chatA, CredentialRef: "chat-a", Models: shared},
-			"connection-b": {Name: "connection-b", Protocol: config.Chat, BaseURL: chatB, CredentialRef: "chat-b", Models: shared},
+			"connection-a": {ID: "connection-a-id", AuthType: config.AuthAPIKey, Name: "connection-a", Protocol: config.Chat, BaseURL: chatA, CredentialRef: "chat-a", Models: shared},
+			"connection-b": {ID: "connection-b-id", AuthType: config.AuthAPIKey, Name: "connection-b", Protocol: config.Chat, BaseURL: chatB, CredentialRef: "chat-b", Models: shared},
 		}},
 		"anthropic-provider": {Name: "Anthropic", Connections: map[string]config.Connection{
-			"connection": {Name: "connection", Protocol: config.Anthropic, BaseURL: anthropic, CredentialRef: "anthropic", Models: anthropicModels},
+			"connection": {ID: "anthropic-id", AuthType: config.AuthAPIKey, Name: "connection", Protocol: config.Anthropic, BaseURL: anthropic, CredentialRef: "anthropic", Models: anthropicModels},
 		}},
 		"responses-provider": {Name: "Responses", Connections: map[string]config.Connection{
-			"connection": {Name: "connection", Protocol: config.Responses, BaseURL: responses, CredentialRef: "responses", Models: responsesModels},
+			"connection": {ID: "responses-id", AuthType: config.AuthAPIKey, Name: "connection", Protocol: config.Responses, BaseURL: responses, CredentialRef: "responses", Models: responsesModels},
 		}},
 	}
 	state.Profiles = map[string]config.Profile{
@@ -293,8 +293,12 @@ func waitForReady(t *testing.T, st *store.Store) RuntimeState {
 			request.Header.Set(probeHeader, runtimeState.ProbeToken)
 			response, err := client.Do(request)
 			if err == nil {
+				var payload struct {
+					Ready bool `json:"ready"`
+				}
+				decodeErr := json.NewDecoder(response.Body).Decode(&payload)
 				_ = response.Body.Close()
-				if response.StatusCode == http.StatusOK {
+				if response.StatusCode == http.StatusOK && decodeErr == nil && payload.Ready {
 					return runtimeState
 				}
 			}

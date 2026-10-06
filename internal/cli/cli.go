@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -18,6 +19,7 @@ import (
 type Options struct {
 	OnChange          func() error
 	ProfileReferenced func(profileID string) (bool, error)
+	Login             func(context.Context, bool) (config.OAuthCredential, error)
 }
 
 // VersionInfo 保存构建时注入的版本信息，供 version 命令输出。
@@ -93,7 +95,29 @@ func NewCommandWithOptions(opts Options) *cobra.Command {
 	root.AddCommand(newUpgradeCommand(upgrade.Run))
 	root.AddCommand(newProviderCommand(func() (*store.Store, error) { return store.New(stateDir) }, opts))
 	root.AddCommand(newProfileCommand(func() (*store.Store, error) { return store.New(stateDir) }, opts))
+	root.AddCommand(stateCommand(func() (*store.Store, error) { return store.New(stateDir) }))
 	return root
+}
+
+func stateCommand(open storeFactory) *cobra.Command {
+	parent := &cobra.Command{Use: "state", Short: "管理本地状态格式"}
+	parent.AddCommand(&cobra.Command{Use: "migrate", Short: "将本地状态逐版本迁移到当前格式", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
+		s, err := open()
+		if err != nil {
+			return err
+		}
+		lock, err := s.AcquireRunLock()
+		if err != nil {
+			return fmt.Errorf("迁移前必须停止网关：%w", err)
+		}
+		defer lock.Close()
+		if err := s.Migrate(); err != nil {
+			return err
+		}
+		_, err = fmt.Fprintln(cmd.OutOrStdout(), "状态迁移检查完成")
+		return err
+	}})
+	return parent
 }
 
 func notifyChanged(cmd *cobra.Command, opts Options) error {

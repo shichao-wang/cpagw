@@ -158,6 +158,8 @@ func seedProvider(st *store.Store) error {
 			DefaultCredentialRef: "test-key",
 			Connections: map[string]config.Connection{
 				"default": {
+					ID:       "profile-test-connection",
+					AuthType: config.AuthAPIKey,
 					Name:     "default",
 					Protocol: config.Chat,
 					BaseURL:  "https://api.example.test",

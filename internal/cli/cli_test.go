@@ -2,10 +2,12 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/shichao-wang/cpagw/internal/config"
 	"github.com/shichao-wang/cpagw/internal/profile"
@@ -23,7 +25,9 @@ func TestListAndShowNeverPrintSecretsOrReferences(t *testing.T) {
 		t.Fatal(err)
 	}
 	conn := config.Connection{
+		ID:       "test-connection-id",
 		Name:     "default",
+		AuthType: config.AuthAPIKey,
 		Protocol: config.Chat,
 		BaseURL:  "https://api.example.test",
 		Models:   []config.Model{{ID: "upstream-model"}},
@@ -76,6 +80,175 @@ func TestListAndShowNeverPrintSecretsOrReferences(t *testing.T) {
 	}
 }
 
+func TestConnectionAddCodexOAuthDefaultsOfficialEndpoint(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.CreateProvider(st, "openai", ""); err != nil {
+		t.Fatal(err)
+	}
+	modelsPath := filepath.Join(dir, "models.yaml")
+	if err := os.WriteFile(modelsPath, []byte("- id: gpt-test\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	root := NewCommand()
+	root.SetArgs([]string{"--state-dir", dir, "provider", "connection", "add", "openai", "codex", "--auth-type", "codex-oauth", "--protocol", "responses", "--models", modelsPath})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("OAuth connection add 失败：%v", err)
+	}
+	state, err := st.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := state.Providers["openai"].Connections["codex"]
+	if c.ID == "" || c.AuthType != config.AuthCodexOAuth || c.BaseURL != config.CodexBaseURL || c.CredentialRef != "" {
+		t.Fatalf("OAuth connection 设置不正确：%#v", c)
+	}
+}
+
+func TestConnectionAddRunningGatewayRejectsOnlyOAuth(t *testing.T) {
+	for _, authType := range []string{config.AuthCodexOAuth, config.AuthAPIKey} {
+		t.Run(authType, func(t *testing.T) {
+			st, err := store.New(filepath.Join(t.TempDir(), "state"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := provider.CreateProvider(st, "openai", ""); err != nil {
+				t.Fatal(err)
+			}
+			before, err := st.Read()
+			if err != nil {
+				t.Fatal(err)
+			}
+			lock, err := st.AcquireRunLock()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lock.Close()
+			modelsPath := filepath.Join(st.Dir, "models.yaml")
+			if err := os.WriteFile(modelsPath, []byte("- id: gpt-test\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			changes := 0
+			root := NewCommandWithOptions(Options{OnChange: func() error { changes++; return nil }})
+			var output bytes.Buffer
+			root.SetOut(&output)
+			root.SetErr(&output)
+			args := []string{"--state-dir", st.Dir, "provider", "connection", "add", "openai", "candidate", "--auth-type", authType, "--protocol", "responses", "--models", modelsPath}
+			if authType == config.AuthAPIKey {
+				args = append(args, "--base-url", "https://mock.example.test")
+			}
+			root.SetArgs(args)
+			err = root.Execute()
+			after, readErr := st.Read()
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			_, added := after.Providers["openai"].Connections["candidate"]
+			if authType == config.AuthCodexOAuth {
+				if err == nil || !strings.Contains(err.Error(), "网关") || added || after.Revision != before.Revision || changes != 0 {
+					t.Fatal("运行中新增 OAuth 连接没有在写入前拒绝")
+				}
+			} else if err != nil || !added || changes != 1 || after.Revision != before.Revision+1 {
+				t.Fatalf("API-key 待配置连接的热更新被错误限制：%v", err)
+			}
+		})
+	}
+}
+
+func TestCodexOAuthLoginAndLogoutCommands(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.CreateProvider(st, "openai", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.AddConnection(st, "openai", config.Connection{
+		Name: "codex", AuthType: config.AuthCodexOAuth, Protocol: config.Responses,
+		BaseURL: config.CodexBaseURL, Models: []config.Model{{ID: "gpt-test"}},
+	}, ""); err != nil {
+		t.Fatal(err)
+	}
+	loginCalled := false
+	opts := Options{Login: func(_ context.Context, noBrowser bool) (config.OAuthCredential, error) {
+		loginCalled = true
+		if !noBrowser {
+			t.Fatal("--no-browser 未传递给登录器")
+		}
+		return config.OAuthCredential{AccessToken: "access-secret", RefreshToken: "refresh-secret", IDToken: "id-secret", AccountID: "private-account", ExpiresAt: time.Now().Add(time.Hour), Generation: 1}, nil
+	}}
+	root := NewCommandWithOptions(opts)
+	var output bytes.Buffer
+	root.SetOut(&output)
+	root.SetErr(&output)
+	root.SetArgs([]string{"--state-dir", dir, "provider", "connection", "login", "openai", "codex", "--no-browser"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("login 失败：%v", err)
+	}
+	if !loginCalled {
+		t.Fatal("注入登录器未调用")
+	}
+	state, c, err := getConnection(st, "openai", "codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.CredentialRef == "" || state.OAuthCredentials[c.CredentialRef].AccessToken != "access-secret" {
+		t.Fatal("OAuth 凭证没有绑定到目标连接")
+	}
+	for _, secret := range []string{"access-secret", "refresh-secret", "id-secret", "private-account", c.CredentialRef} {
+		if strings.Contains(output.String(), secret) {
+			t.Fatalf("login 输出泄漏 OAuth 凭证数据 %q", secret)
+		}
+	}
+
+	output.Reset()
+	root = NewCommand()
+	root.SetOut(&output)
+	root.SetErr(&output)
+	root.SetArgs([]string{"--state-dir", dir, "provider", "connection", "show", "openai", "codex"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("connection show 失败：%v", err)
+	}
+	root = NewCommand()
+	root.SetOut(&output)
+	root.SetErr(&output)
+	root.SetArgs([]string{"--state-dir", dir, "provider", "check", "openai", "--connection", "codex"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("OAuth check 失败：%v", err)
+	}
+	if !strings.Contains(output.String(), "未请求通用 /models") {
+		t.Fatalf("OAuth check 未表明不发送通用目录请求：%q", output.String())
+	}
+	for _, secret := range []string{"access-secret", "refresh-secret", "id-secret", "private-account", c.CredentialRef} {
+		if strings.Contains(output.String(), secret) {
+			t.Fatalf("show/check 输出泄漏 OAuth 凭证数据 %q", secret)
+		}
+	}
+
+	root = NewCommand()
+	root.SetArgs([]string{"--state-dir", dir, "provider", "connection", "logout", "openai", "codex", "--yes"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("logout 失败：%v", err)
+	}
+	_, c, err = getConnection(st, "openai", "codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.AuthType != config.AuthCodexOAuth || c.CredentialRef != "" {
+		t.Fatalf("logout 应保留 OAuth 连接但清除其凭证：%#v", c)
+	}
+}
+
 func TestApiKeyRequiresExplicitStdinInNonInteractiveMode(t *testing.T) {
 	modelPath := filepath.Join(t.TempDir(), "models.yaml")
 	if err := os.WriteFile(modelPath, []byte("- id: upstream-model\\n"), 0600); err != nil {
@@ -115,6 +288,61 @@ func TestVersionFlagsRejected(t *testing.T) {
 		if err := root.Execute(); err == nil {
 			t.Fatalf("%s 应被拒绝，实际输出：%q", arg, output.String())
 		}
+	}
+}
+
+func TestStateMigrateCommand(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	v1 := `{"schemaVersion":1,"revision":3,"listen":"127.0.0.1:8317","providers":{},"profiles":{},"secrets":{}}`
+	statePath := filepath.Join(dir, "state.json")
+	if err := os.WriteFile(statePath, []byte(v1), 0600); err != nil {
+		t.Fatal(err)
+	}
+	root := NewCommand()
+	var output bytes.Buffer
+	root.SetOut(&output)
+	root.SetErr(&output)
+	root.SetArgs([]string{"--state-dir", dir, "state", "migrate"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("state migrate 执行失败：%v", err)
+	}
+	migrated, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(migrated), `"schemaVersion": 2`) {
+		t.Fatalf("状态未迁移到 v2：%s", migrated)
+	}
+	backup, err := os.ReadFile(statePath + ".v1.bak")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(backup) != v1 {
+		t.Fatalf("迁移备份不等于原始状态：%s", backup)
+	}
+}
+
+func TestStateMigrateRejectsRunningGateway(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := st.AcquireRunLock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	root := NewCommand()
+	root.SetArgs([]string{"--state-dir", dir, "state", "migrate"})
+	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "停止网关") {
+		t.Fatalf("应拒绝在网关锁占用时迁移，得到：%v", err)
 	}
 }
 

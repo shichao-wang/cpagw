@@ -8,6 +8,7 @@ import (
 	"strconv"
 
 	"github.com/shichao-wang/cpagw/internal/agent/claudecode"
+	"github.com/shichao-wang/cpagw/internal/codexoauth"
 	"github.com/shichao-wang/cpagw/internal/config"
 	"github.com/shichao-wang/cpagw/internal/server"
 	"github.com/shichao-wang/cpagw/internal/store"
@@ -25,6 +26,7 @@ func NewAppCommand() *cobra.Command {
 		return store.New(dir)
 	}
 	root = NewCommandWithOptions(Options{
+		Login: codexoauth.NewLogin().Login,
 		OnChange: func() error {
 			s, err := openStore()
 			if err != nil {
