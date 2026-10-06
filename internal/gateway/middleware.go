@@ -404,8 +404,8 @@ func (w *transformWriter) WriteHeader(code int) {
 	if w.committed || w.checkHealth() != nil {
 		return
 	}
+	// 状态与正文在最终健康检查或 SSE 写出边界统一提交，不依赖底层延迟写头。
 	w.status = code
-	w.ResponseWriter.WriteHeader(code)
 }
 
 func (w *transformWriter) WriteHeaderNow() {
