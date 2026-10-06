@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -134,6 +135,19 @@ func AddConnection(st *store.Store, providerName string, conn config.Connection,
 			return err
 		}
 	}
+	err = addConnectionUpdate(st, providerName, conn, apiKey, false)
+	if !errors.Is(err, errRuntimeLockRequired) {
+		return err
+	}
+	lock, err := st.AcquireRunLock()
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	return addConnectionUpdate(st, providerName, conn, apiKey, true)
+}
+
+func addConnectionUpdate(st *store.Store, providerName string, conn config.Connection, apiKey string, hasRuntimeLock bool) error {
 	return st.Update(func(s *config.State) error {
 		p, ok := s.Providers[providerName]
 		if !ok {
@@ -141,6 +155,9 @@ func AddConnection(st *store.Store, providerName string, conn config.Connection,
 		}
 		if _, exists := p.Connections[conn.Name]; exists {
 			return fmt.Errorf("连接已存在：%s/%s", providerName, conn.Name)
+		}
+		if conn.AuthType == config.AuthCodexOAuth && !hasRuntimeLock {
+			return errRuntimeLockRequired
 		}
 		if apiKey != "" {
 			ref, err := newSecretRef()

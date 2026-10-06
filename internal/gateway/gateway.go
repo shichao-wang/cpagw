@@ -256,6 +256,10 @@ func compile(state *config.State, st *store.Store) (*snapshot, error) {
 			case config.AuthAPIKey:
 				info.apiKey, err = state.Key(pname, connection)
 				if err != nil {
+					// 未被 profile 使用的待配置连接不进入 SDK，也不影响其他连接。
+					if len(state.References(pname, cname, "")) == 0 {
+						continue
+					}
 					return nil, err
 				}
 			case config.AuthCodexOAuth:

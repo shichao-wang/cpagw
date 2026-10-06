@@ -111,6 +111,56 @@ func TestConnectionAddCodexOAuthDefaultsOfficialEndpoint(t *testing.T) {
 	}
 }
 
+func TestConnectionAddRunningGatewayRejectsOnlyOAuth(t *testing.T) {
+	for _, authType := range []string{config.AuthCodexOAuth, config.AuthAPIKey} {
+		t.Run(authType, func(t *testing.T) {
+			st, err := store.New(filepath.Join(t.TempDir(), "state"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := provider.CreateProvider(st, "openai", ""); err != nil {
+				t.Fatal(err)
+			}
+			before, err := st.Read()
+			if err != nil {
+				t.Fatal(err)
+			}
+			lock, err := st.AcquireRunLock()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lock.Close()
+			modelsPath := filepath.Join(st.Dir, "models.yaml")
+			if err := os.WriteFile(modelsPath, []byte("- id: gpt-test\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			changes := 0
+			root := NewCommandWithOptions(Options{OnChange: func() error { changes++; return nil }})
+			var output bytes.Buffer
+			root.SetOut(&output)
+			root.SetErr(&output)
+			args := []string{"--state-dir", st.Dir, "provider", "connection", "add", "openai", "candidate", "--auth-type", authType, "--protocol", "responses", "--models", modelsPath}
+			if authType == config.AuthAPIKey {
+				args = append(args, "--base-url", "https://mock.example.test")
+			}
+			root.SetArgs(args)
+			err = root.Execute()
+			after, readErr := st.Read()
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			_, added := after.Providers["openai"].Connections["candidate"]
+			if authType == config.AuthCodexOAuth {
+				if err == nil || !strings.Contains(err.Error(), "网关") || added || after.Revision != before.Revision || changes != 0 {
+					t.Fatal("运行中新增 OAuth 连接没有在写入前拒绝")
+				}
+			} else if err != nil || !added || changes != 1 || after.Revision != before.Revision+1 {
+				t.Fatalf("API-key 待配置连接的热更新被错误限制：%v", err)
+			}
+		})
+	}
+}
+
 func TestCodexOAuthLoginAndLogoutCommands(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0700); err != nil {

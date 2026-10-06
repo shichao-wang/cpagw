@@ -123,6 +123,82 @@ func TestMigrateRejectsUnknownAndFuture(t *testing.T) {
 	}
 }
 
+func TestMigrateRetriesWithMatchingBackupAfterCommitFailure(t *testing.T) {
+	st := testStore(t)
+	v1 := []byte(`{"schemaVersion":1,"revision":0,"listen":"127.0.0.1:8317","providers":{},"profiles":{},"secrets":{}}`)
+	if err := AtomicWrite(st.StatePath(), v1); err != nil {
+		t.Fatal(err)
+	}
+	commitFailed := false
+	err := st.migrate(func(path string, data []byte) error {
+		if path == st.StatePath() && !commitFailed {
+			commitFailed = true
+			return fmt.Errorf("注入最终状态写入失败")
+		}
+		return AtomicWrite(path, data)
+	})
+	if err == nil || !commitFailed {
+		t.Fatal("应模拟备份成功后的最终状态写入失败")
+	}
+	stateBytes, err := os.ReadFile(st.StatePath())
+	if err != nil || string(stateBytes) != string(v1) {
+		t.Fatalf("提交失败后源状态应保留：%v", err)
+	}
+	backupPath := st.StatePath() + ".v1.bak"
+	backup, err := os.ReadFile(backupPath)
+	if err != nil || string(backup) != string(v1) {
+		t.Fatalf("首次迁移未留下有效备份：%v", err)
+	}
+	if err := st.Migrate(); err != nil {
+		t.Fatalf("重试应复用与源状态完全一致的安全备份：%v", err)
+	}
+	state, err := st.Read()
+	if err != nil || state.SchemaVersion != config.SchemaVersion {
+		t.Fatalf("重试未完成迁移：state=%+v err=%v", state, err)
+	}
+}
+
+func TestMigrateRejectsDifferentOrUnsafeExistingBackup(t *testing.T) {
+	for _, name := range []string{"different-content", "symlink", "unsafe-permissions"} {
+		t.Run(name, func(t *testing.T) {
+			st := testStore(t)
+			v1 := []byte(`{"schemaVersion":1,"revision":0,"listen":"127.0.0.1:8317","providers":{},"profiles":{},"secrets":{}}`)
+			if err := AtomicWrite(st.StatePath(), v1); err != nil {
+				t.Fatal(err)
+			}
+			backupPath := st.StatePath() + ".v1.bak"
+			switch name {
+			case "different-content":
+				if err := AtomicWrite(backupPath, []byte("different")); err != nil {
+					t.Fatal(err)
+				}
+			case "symlink":
+				target := st.Path("backup-target")
+				if err := AtomicWrite(target, v1); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, backupPath); err != nil {
+					t.Fatal(err)
+				}
+			case "unsafe-permissions":
+				if err := AtomicWrite(backupPath, v1); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(backupPath, 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := st.Migrate(); err == nil {
+				t.Fatal("应拒绝不一致或不安全的已有备份")
+			}
+			stateBytes, err := os.ReadFile(st.StatePath())
+			if err != nil || string(stateBytes) != string(v1) {
+				t.Fatalf("拒绝备份时源状态不得变更：%v", err)
+			}
+		})
+	}
+}
+
 func TestMigrateWritesBackupAndRejectsV1OnNormalRead(t *testing.T) {
 	s := testStore(t)
 	v1 := `{"schemaVersion":1,"revision":0,"listen":"127.0.0.1:8317","providers":{},"profiles":{},"secrets":{}}`

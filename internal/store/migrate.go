@@ -168,6 +168,10 @@ func migrateV1ToV2(raw json.RawMessage) (json.RawMessage, error) {
 
 // Migrate 备份原始状态文件后，以一次原子写入提交迁移结果。
 func (s *Store) Migrate() error {
+	return s.migrate(AtomicWrite)
+}
+
+func (s *Store) migrate(writeFile func(string, []byte) error) error {
 	return WithLock(s.Path("state.lock"), func() error {
 		path := s.StatePath()
 		if err := CheckFile(path); err != nil {
@@ -188,23 +192,30 @@ func (s *Store) Migrate() error {
 			return nil
 		}
 		// MigrateBytes 已严格验证源状态；备份名跟随实际起始 schema 版本。
-			sourceVersion, err := readSchemaVersion(data)
-			if err != nil {
-				return fmt.Errorf("读取迁移源版本失败")
-			}
-			backup := fmt.Sprintf("%s.v%d.bak", path, sourceVersion)
+		sourceVersion, err := readSchemaVersion(data)
+		if err != nil {
+			return fmt.Errorf("读取迁移源版本失败")
+		}
+		backup := fmt.Sprintf("%s.v%d.bak", path, sourceVersion)
 		if err := CheckFile(backup); err != nil {
 			return err
 		}
 		if _, err := os.Lstat(backup); err == nil {
-			return fmt.Errorf("迁移备份已存在，拒绝覆盖")
-		} else if !os.IsNotExist(err) {
+			backupData, err := os.ReadFile(backup)
+			if err != nil {
+				return fmt.Errorf("读取已有迁移备份失败")
+			}
+			if !bytes.Equal(backupData, data) {
+				return fmt.Errorf("已有迁移备份与当前源状态不同，拒绝覆盖")
+			}
+		} else if os.IsNotExist(err) {
+			if err := writeFile(backup, data); err != nil {
+				return fmt.Errorf("保存迁移备份失败")
+			}
+		} else {
 			return err
 		}
-		if err := AtomicWrite(backup, data); err != nil {
-			return fmt.Errorf("保存迁移备份失败")
-		}
-		if err := AtomicWrite(path, updated); err != nil {
+		if err := writeFile(path, updated); err != nil {
 			return fmt.Errorf("提交迁移结果失败；原文件和备份均保留")
 		}
 		return nil

@@ -127,7 +127,7 @@ cpagw server stop
 cpagw provider connection logout openai codex --yes
 ```
 
-认证方式切换必须在 `provider connection update` 中显式传 `--auth-type`；切换为 API key 时还需在同一命令显式提供 `--api-key-stdin` 或 `--inherit-api-key`，不能静默继承。`login`、`logout`、重登录以及 OAuth 认证类型切换、删除 OAuth 连接/包含 OAuth 连接的 provider，均要求先停止网关；连接保留，logout 只清除本地保存的 OAuth 凭证，不代表向上游撤销授权。OAuth 凭证属于本地敏感状态，可能以明文保存但文件权限限制为 0600；请勿提交或分享状态文件。OAuth 账号可用模型取决于账号实际授权及 SDK 注册目录；模型清单只是本地声明，不保证账号支持该模型，也不意味着任意 Responses 服务兼容。OAuth 检查不会携带 access token 请求通用 `/models` endpoint。
+认证方式切换必须在 `provider connection update` 中显式传 `--auth-type`；切换为 API key 时还需在同一命令显式提供 `--api-key-stdin` 或 `--inherit-api-key`，不能静默继承。新增 OAuth 连接、`login`、`logout`、重登录以及 OAuth 认证类型切换、删除 OAuth 连接/包含 OAuth 连接的 provider，均要求先停止网关；API-key 连接仍支持热更新。连接保留，logout 只清除本地保存的 OAuth 凭证，不代表向上游撤销授权。OAuth 凭证属于本地敏感状态，可能以明文保存但文件权限限制为 0600；请勿提交或分享状态文件。OAuth 账号可用模型取决于账号实际授权及 SDK 注册目录；模型清单只是本地声明，不保证账号支持该模型，也不意味着任意 Responses 服务兼容。OAuth 检查不会携带 access token 请求通用 `/models` endpoint。
 
 上游协议：
 

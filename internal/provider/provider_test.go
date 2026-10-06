@@ -94,6 +94,51 @@ func TestCreateInheritanceRotationAndReferences(t *testing.T) {
 	}
 }
 
+func TestAddOAuthConnectionRequiresStoppedGatewayWhileAPIKeyStaysHot(t *testing.T) {
+	st := testStore(t)
+	if err := CreateProvider(st, "p", ""); err != nil {
+		t.Fatal(err)
+	}
+	before, err := st.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := st.AcquireRunLock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+
+	oauth := config.Connection{Name: "oauth", AuthType: config.AuthCodexOAuth, Protocol: config.Responses, BaseURL: config.CodexBaseURL, Models: []config.Model{{ID: "gpt-5-codex"}}}
+	if err := AddConnection(st, "p", oauth, ""); err == nil {
+		t.Fatal("运行中的网关应拒绝新增 OAuth connection")
+	}
+	afterRejected, err := st.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterRejected.Revision != before.Revision {
+		t.Fatalf("锁冲突不应增加 revision：%d→%d", before.Revision, afterRejected.Revision)
+	}
+	if _, exists := afterRejected.Providers["p"].Connections["oauth"]; exists {
+		t.Fatal("锁冲突不应创建 OAuth connection")
+	}
+
+	if err := AddConnection(st, "p", testConnection("api", "https://api.example.test"), ""); err != nil {
+		t.Fatalf("运行中的网关应允许 API-key connection 热更新：%v", err)
+	}
+	afterAPIKey, err := st.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := afterAPIKey.Providers["p"].Connections["api"]; !exists {
+		t.Fatal("API-key connection 未创建")
+	}
+	if afterAPIKey.Revision != before.Revision+1 {
+		t.Fatalf("API-key connection 添加 revision 错误：%d→%d", before.Revision, afterAPIKey.Revision)
+	}
+}
+
 func TestUpdateConnectionRejectsRemovingReferencedModel(t *testing.T) {
 	st := testStore(t)
 	if err := Create(st, "p", testConnection("c", "https://api.example.test"), "secret"); err != nil {
