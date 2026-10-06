@@ -1,10 +1,12 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
+	"time"
 
 	"github.com/shichao-wang/cpagw/internal/config"
 	"github.com/shichao-wang/cpagw/internal/provider"
@@ -99,7 +101,7 @@ func newProviderCommand(open storeFactory, opts Options) *cobra.Command {
 		if !ok {
 			return fmt.Errorf("提供商不存在：%s", args[0])
 		}
-		return json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]any{"name": p.Name, "defaultKeyConfigured": state.Secrets[p.DefaultCredentialRef] != "", "connections": connectionViews(p)})
+		return json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]any{"name": p.Name, "defaultKeyConfigured": state.Secrets[p.DefaultCredentialRef] != "", "connections": connectionViews(state, p)})
 	}})
 	var yes bool
 	remove := &cobra.Command{Use: "remove <name>", Short: "删除未被 profile 引用的提供商", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
@@ -124,14 +126,30 @@ func newProviderCommand(open storeFactory, opts Options) *cobra.Command {
 	parent.AddCommand(connectionCommand(open, opts), providerDirectoryCommand(open, false), providerDirectoryCommand(open, true))
 	return parent
 }
-func connectionView(c config.Connection) map[string]any {
-	source := "provider-default"
-	if c.CredentialRef != "" {
-		source = "connection-override"
+func connectionView(state *config.State, providerName string, c config.Connection) map[string]any {
+	view := map[string]any{"name": c.Name, "protocol": c.Protocol, "authType": c.AuthType, "baseURL": c.BaseURL, "models": c.Models}
+	if c.AuthType == config.AuthCodexOAuth {
+		credential, ok := state.OAuthCredentials[c.CredentialRef]
+		status := "not-logged-in"
+		if c.CredentialRef != "" && ok && config.ValidateOAuthCredential(credential) == nil {
+			status = "ready"
+		}
+		view["credentialStatus"] = status
+		return view
 	}
-	return map[string]any{"name": c.Name, "protocol": c.Protocol, "baseURL": c.BaseURL, "credentialSource": source, "models": c.Models}
+	provider := state.Providers[providerName]
+	ref := c.CredentialRef
+	source := "provider-default"
+	if ref != "" {
+		source = "connection-override"
+	} else {
+		ref = provider.DefaultCredentialRef
+	}
+	view["credentialSource"] = source
+	view["credentialConfigured"] = config.ValidateKey(state.Secrets[ref]) == nil
+	return view
 }
-func connectionViews(p config.Provider) []map[string]any {
+func connectionViews(state *config.State, p config.Provider) []map[string]any {
 	names := make([]string, 0, len(p.Connections))
 	for name := range p.Connections {
 		names = append(names, name)
@@ -139,21 +157,35 @@ func connectionViews(p config.Provider) []map[string]any {
 	sort.Strings(names)
 	result := make([]map[string]any, 0, len(names))
 	for _, name := range names {
-		result = append(result, connectionView(p.Connections[name]))
+		result = append(result, connectionView(state, p.Name, p.Connections[name]))
 	}
 	return result
 }
 func connectionCommand(open storeFactory, opts Options) *cobra.Command {
 	parent := &cobra.Command{Use: "connection", Short: "管理提供商下的协议连接"}
-	var protocol, base, modelsPath string
+	var protocol, base, modelsPath, authType string
 	var stdin bool
-	add := &cobra.Command{Use: "add <provider> <connection>", Short: "添加协议连接，默认继承提供商 key", Args: cobra.ExactArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
+	add := &cobra.Command{Use: "add <provider> <connection>", Short: "添加协议连接", Args: cobra.ExactArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
 		models, err := readModels(modelsPath)
 		if err != nil {
 			return err
 		}
 		key := ""
-		if stdin {
+		if authType == config.AuthCodexOAuth {
+			if stdin {
+				return fmt.Errorf("Codex OAuth 连接不能设置 API key")
+			}
+			if protocol != config.Responses {
+				return fmt.Errorf("Codex OAuth 仅支持 responses 协议")
+			}
+			if base == "" {
+				base = config.CodexBaseURL
+			} else if base != config.CodexBaseURL {
+				return fmt.Errorf("Codex OAuth 必须使用官方 API 地址：%s", config.CodexBaseURL)
+			}
+		} else if authType != config.AuthAPIKey {
+			return fmt.Errorf("不支持的认证方式：%s", authType)
+		} else if stdin {
 			key, err = apiKey(cmd, true)
 			if err != nil {
 				return err
@@ -163,7 +195,7 @@ func connectionCommand(open storeFactory, opts Options) *cobra.Command {
 		if err != nil {
 			return err
 		}
-		if err = provider.AddConnection(s, args[0], config.Connection{Name: args[1], Protocol: protocol, BaseURL: base, Models: models}, key); err != nil {
+		if err = provider.AddConnection(s, args[0], config.Connection{Name: args[1], AuthType: authType, Protocol: protocol, BaseURL: base, Models: models}, key); err != nil {
 			return err
 		}
 		if err = notifyChanged(cmd, opts); err != nil {
@@ -172,11 +204,12 @@ func connectionCommand(open storeFactory, opts Options) *cobra.Command {
 		_, err = fmt.Fprintln(cmd.OutOrStdout(), "连接已添加")
 		return err
 	}}
+	add.Flags().StringVar(&authType, "auth-type", config.AuthAPIKey, "认证方式：api-key 或 codex-oauth")
 	add.Flags().StringVar(&protocol, "protocol", "", "chat-completions、anthropic-messages 或 responses")
-	add.Flags().StringVar(&base, "base-url", "", "该协议的 API 根地址")
+	add.Flags().StringVar(&base, "base-url", "", "该协议的 API 根地址（Codex OAuth 固定为官方 endpoint，可省略）")
 	add.Flags().StringVar(&modelsPath, "models", "", "模型清单 YAML 文件")
 	add.Flags().BoolVar(&stdin, "api-key-stdin", false, "从标准输入读取连接专属 key，不提供则继承默认 key")
-	for _, flag := range []string{"protocol", "base-url", "models"} {
+	for _, flag := range []string{"protocol", "models"} {
 		_ = add.MarkFlagRequired(flag)
 	}
 	parent.AddCommand(add, connectionUpdateCommand(open, opts))
@@ -193,18 +226,18 @@ func connectionCommand(open storeFactory, opts Options) *cobra.Command {
 		if !ok {
 			return fmt.Errorf("提供商不存在")
 		}
-		return json.NewEncoder(cmd.OutOrStdout()).Encode(connectionViews(p))
+		return json.NewEncoder(cmd.OutOrStdout()).Encode(connectionViews(state, p))
 	}})
 	parent.AddCommand(&cobra.Command{Use: "show <provider> <connection>", Short: "查看连接，不显示凭证", Args: cobra.ExactArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
 		s, err := open()
 		if err != nil {
 			return err
 		}
-		_, c, err := getConnection(s, args[0], args[1])
+		state, c, err := getConnection(s, args[0], args[1])
 		if err != nil {
 			return err
 		}
-		return json.NewEncoder(cmd.OutOrStdout()).Encode(connectionView(c))
+		return json.NewEncoder(cmd.OutOrStdout()).Encode(connectionView(state, args[0], c))
 	}})
 	var yes bool
 	remove := &cobra.Command{Use: "remove <provider> <connection>", Short: "删除未被引用的连接", Args: cobra.ExactArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
@@ -226,14 +259,70 @@ func connectionCommand(open storeFactory, opts Options) *cobra.Command {
 	}}
 	remove.Flags().BoolVar(&yes, "yes", false, "确认删除")
 	parent.AddCommand(remove)
+	parent.AddCommand(connectionLoginCommand(open, opts), connectionLogoutCommand(open))
 	return parent
 }
+
+func connectionLoginCommand(open storeFactory, opts Options) *cobra.Command {
+	var noBrowser bool
+	cmd := &cobra.Command{Use: "login <provider> <connection>", Short: "登录 Codex OAuth 连接", Args: cobra.ExactArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
+		if opts.Login == nil {
+			return fmt.Errorf("Codex OAuth 登录器未配置")
+		}
+		s, err := open()
+		if err != nil {
+			return err
+		}
+		session, err := provider.BeginOAuth(s, args[0], args[1])
+		if err != nil {
+			return err
+		}
+		defer session.Close()
+		ctx, cancel := context.WithTimeout(cmd.Context(), 15*time.Minute)
+		defer cancel()
+		credential, err := opts.Login(ctx, noBrowser)
+		if err != nil {
+			return err
+		}
+		if err = session.Commit(credential); err != nil {
+			return err
+		}
+		_, err = fmt.Fprintln(cmd.OutOrStdout(), "Codex OAuth 登录完成；连接已绑定该账号")
+		return err
+	}}
+	cmd.Flags().BoolVar(&noBrowser, "no-browser", false, "不自动打开官方设备授权页面")
+	return cmd
+}
+
+func connectionLogoutCommand(open storeFactory) *cobra.Command {
+	var yes bool
+	cmd := &cobra.Command{Use: "logout <provider> <connection>", Short: "清除该 Codex OAuth 连接的本地凭证", Args: cobra.ExactArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
+		if err := confirmRemoval(cmd, yes, args[0]+"/"+args[1]+" 的本地 OAuth 凭证"); err != nil {
+			return err
+		}
+		s, err := open()
+		if err != nil {
+			return err
+		}
+		if err = provider.LogoutOAuth(s, args[0], args[1]); err != nil {
+			return err
+		}
+		_, err = fmt.Fprintln(cmd.OutOrStdout(), "本地 OAuth 凭证已清除；连接和 profile 绑定已保留")
+		return err
+	}}
+	cmd.Flags().BoolVar(&yes, "yes", false, "确认清除本地 OAuth 凭证")
+	return cmd
+}
+
 func connectionUpdateCommand(open storeFactory, opts Options) *cobra.Command {
-	var base, modelsPath string
+	var base, modelsPath, authType string
 	var stdin, inherit bool
 	cmd := &cobra.Command{Use: "update <provider> <connection>", Short: "原子更新地址、模型清单和 key 配置", Args: cobra.ExactArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
 		if stdin && inherit {
 			return fmt.Errorf("--api-key-stdin 和 --inherit-api-key 不能同时使用")
+		}
+		if cmd.Flags().Changed("auth-type") && authType == config.AuthCodexOAuth && (stdin || inherit) {
+			return fmt.Errorf("Codex OAuth 不能与 API key flags 同时使用")
 		}
 		var url *string
 		if cmd.Flags().Changed("base-url") {
@@ -247,6 +336,14 @@ func connectionUpdateCommand(open storeFactory, opts Options) *cobra.Command {
 			}
 			models = &m
 		}
+		var auth *string
+		if cmd.Flags().Changed("auth-type") {
+			auth = &authType
+			if authType == config.AuthCodexOAuth && url == nil {
+				officialURL := config.CodexBaseURL
+				url = &officialURL
+			}
+		}
 		var key *string
 		if stdin {
 			k, err := apiKey(cmd, true)
@@ -255,14 +352,14 @@ func connectionUpdateCommand(open storeFactory, opts Options) *cobra.Command {
 			}
 			key = &k
 		}
-		if url == nil && models == nil && key == nil && !inherit {
+		if url == nil && models == nil && key == nil && !inherit && auth == nil {
 			return fmt.Errorf("请指定至少一个更新字段")
 		}
 		s, err := open()
 		if err != nil {
 			return err
 		}
-		if err = provider.PatchConnection(s, args[0], args[1], url, models, key, inherit); err != nil {
+		if err = provider.PatchConnectionWithAuth(s, args[0], args[1], url, models, key, inherit, auth); err != nil {
 			return err
 		}
 		if err = notifyChanged(cmd, opts); err != nil {
@@ -271,6 +368,7 @@ func connectionUpdateCommand(open storeFactory, opts Options) *cobra.Command {
 		_, err = fmt.Fprintln(cmd.OutOrStdout(), "连接已更新")
 		return err
 	}}
+	cmd.Flags().StringVar(&authType, "auth-type", "", "显式切换认证方式：api-key 或 codex-oauth")
 	cmd.Flags().StringVar(&base, "base-url", "", "新的 API 根地址")
 	cmd.Flags().StringVar(&modelsPath, "models", "", "新的模型清单 YAML 文件")
 	cmd.Flags().BoolVar(&stdin, "api-key-stdin", false, "从标准输入读取连接专属 key")
@@ -294,6 +392,15 @@ func providerDirectoryCommand(open storeFactory, check bool) *cobra.Command {
 		}
 		if !check {
 			return json.NewEncoder(cmd.OutOrStdout()).Encode(c.Models)
+		}
+		if c.AuthType == config.AuthCodexOAuth {
+			credential, ok := state.OAuthCredentials[c.CredentialRef]
+			if c.CredentialRef == "" || !ok || config.ValidateOAuthCredential(credential) != nil {
+				_, err = fmt.Fprintln(cmd.OutOrStdout(), "Codex OAuth 尚未登录；未发送网络请求")
+				return err
+			}
+			_, err = fmt.Fprintln(cmd.OutOrStdout(), "Codex OAuth 凭证已保存；未请求通用 /models endpoint")
+			return err
 		}
 		key, err := state.Key(args[0], c)
 		if err != nil {

@@ -61,6 +61,9 @@ func ValidateConnection(c config.Connection) error {
 	if err := config.ValidateName(c.Name); err != nil {
 		return err
 	}
+	if err := config.ValidateAuthConnection(c); err != nil {
+		return err
+	}
 	switch c.Protocol {
 	case config.Chat, config.Anthropic, config.Responses:
 	default:
@@ -77,11 +80,19 @@ func Create(st *store.Store, name string, conn config.Connection, apiKey string)
 	if err := config.ValidateName(name); err != nil {
 		return err
 	}
+	if conn.AuthType != config.AuthAPIKey {
+		return fmt.Errorf("Create 仅用于 API key 连接；OAuth 请使用 AddConnection")
+	}
+	id, err := config.RandomID()
+	if err != nil {
+		return fmt.Errorf("生成连接 ID 失败")
+	}
+	conn.ID = id
 	if err := ValidateConnection(conn); err != nil {
 		return err
 	}
-	if strings.TrimSpace(apiKey) == "" {
-		return fmt.Errorf("API key 不能为空")
+	if err := config.ValidateKey(apiKey); err != nil {
+		return err
 	}
 	return st.Update(func(s *config.State) error {
 		if _, ok := s.Providers[name]; ok {
@@ -104,11 +115,24 @@ func Create(st *store.Store, name string, conn config.Connection, apiKey string)
 
 // AddConnection 新增连接；apiKey 为空表示继承提供商默认 key。
 func AddConnection(st *store.Store, providerName string, conn config.Connection, apiKey string) error {
+	if conn.AuthType != config.AuthAPIKey && conn.AuthType != config.AuthCodexOAuth {
+		return fmt.Errorf("必须显式声明有效的认证方式")
+	}
+	id, err := config.RandomID()
+	if err != nil {
+		return fmt.Errorf("生成连接 ID 失败")
+	}
+	conn.ID = id
 	if err := ValidateConnection(conn); err != nil {
 		return err
 	}
-	if apiKey != "" && strings.TrimSpace(apiKey) == "" {
-		return fmt.Errorf("API key 不能为空")
+	if conn.AuthType == config.AuthCodexOAuth && apiKey != "" {
+		return fmt.Errorf("Codex OAuth 连接不能设置 API key")
+	}
+	if conn.AuthType == config.AuthAPIKey && apiKey != "" {
+		if err := config.ValidateKey(apiKey); err != nil {
+			return err
+		}
 	}
 	return st.Update(func(s *config.State) error {
 		p, ok := s.Providers[providerName]
@@ -176,6 +200,9 @@ func UpdateConnection(st *store.Store, providerName, connectionName string, base
 		if baseURL != nil {
 			c.BaseURL = *baseURL
 		}
+		if err := ValidateConnection(c); err != nil {
+			return err
+		}
 		p.Connections[connectionName] = c
 		s.Providers[providerName] = p
 		return nil
@@ -205,83 +232,11 @@ func RotateDefaultKey(st *store.Store, providerName, apiKey string) error {
 	})
 }
 
-// SetConnectionKey 设置连接专属 key；apiKey 为空则恢复继承默认 key。
-func SetConnectionKey(st *store.Store, providerName, connectionName, apiKey string) error {
-	return st.Update(func(s *config.State) error {
-		p, ok := s.Providers[providerName]
-		if !ok {
-			return fmt.Errorf("提供商不存在：%s", providerName)
-		}
-		c, ok := p.Connections[connectionName]
-		if !ok {
-			return fmt.Errorf("连接不存在：%s/%s", providerName, connectionName)
-		}
-		oldRef := c.CredentialRef
-		if apiKey == "" {
-			c.CredentialRef = ""
-		} else {
-			if strings.TrimSpace(apiKey) == "" {
-				return fmt.Errorf("API key 不能为空")
-			}
-			ref, err := newSecretRef()
-			if err != nil {
-				return fmt.Errorf("生成凭证引用失败")
-			}
-			c.CredentialRef = ref
-			s.Secrets[ref] = apiKey
-		}
-		p.Connections[connectionName] = c
-		s.Providers[providerName] = p
-		deleteIfUnreferenced(s, oldRef)
-		return nil
-	})
-}
-
-// RemoveConnection 拒绝删除仍被 profile 使用的连接。
-func RemoveConnection(st *store.Store, providerName, connectionName string) error {
-	return st.Update(func(s *config.State) error {
-		p, ok := s.Providers[providerName]
-		if !ok {
-			return fmt.Errorf("提供商不存在：%s", providerName)
-		}
-		c, ok := p.Connections[connectionName]
-		if !ok {
-			return fmt.Errorf("连接不存在：%s/%s", providerName, connectionName)
-		}
-		if refs := s.References(providerName, connectionName, ""); len(refs) != 0 {
-			return fmt.Errorf("连接仍被 profile 使用：%s", strings.Join(refs, ", "))
-		}
-		delete(p.Connections, connectionName)
-		s.Providers[providerName] = p
-		deleteIfUnreferenced(s, c.CredentialRef)
-		return nil
-	})
-}
-
-// Remove 删除提供商及其未再引用的凭证。
-func Remove(st *store.Store, providerName string) error {
-	return st.Update(func(s *config.State) error {
-		p, ok := s.Providers[providerName]
-		if !ok {
-			return fmt.Errorf("提供商不存在：%s", providerName)
-		}
-		if refs := s.References(providerName, "", ""); len(refs) != 0 {
-			return fmt.Errorf("提供商仍被 profile 使用：%s", strings.Join(refs, ", "))
-		}
-		refs := []string{p.DefaultCredentialRef}
-		for _, c := range p.Connections {
-			refs = append(refs, c.CredentialRef)
-		}
-		delete(s.Providers, providerName)
-		for _, ref := range refs {
-			deleteIfUnreferenced(s, ref)
-		}
-		return nil
-	})
-}
-
 // Check 仅通过有超时和响应上限的 GET 请求检查模型目录，不发送推理请求。
 func Check(ctx context.Context, c config.Connection, apiKey string) error {
+	if c.AuthType != config.AuthAPIKey {
+		return fmt.Errorf("该连接不是 API key 认证，不能通过通用模型目录检查")
+	}
 	if err := ValidateConnection(c); err != nil {
 		return err
 	}

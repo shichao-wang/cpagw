@@ -184,6 +184,8 @@ func testStore(t *testing.T) *store.Store {
 
 func testConnection(name, baseURL string) config.Connection {
 	return config.Connection{
+		ID:       "test-connection-id-" + name,
+		AuthType: config.AuthAPIKey,
 		Name:     name,
 		Protocol: config.Chat,
 		BaseURL:  baseURL,

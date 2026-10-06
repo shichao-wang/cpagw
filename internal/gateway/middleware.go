@@ -13,6 +13,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	cliproxy "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy"
+	"github.com/shichao-wang/cpagw/internal/codexoauth"
+	"github.com/shichao-wang/cpagw/internal/config"
 	"github.com/shichao-wang/cpagw/internal/store"
 )
 
@@ -22,6 +25,7 @@ type requestGate struct {
 	token      string
 	instanceID string
 	ready      atomic.Bool
+	oauth      *codexoauth.SDKStore
 }
 
 func (g *requestGate) middleware() gin.HandlerFunc {
@@ -76,7 +80,7 @@ func (g *requestGate) middleware() gin.HandlerFunc {
 			return
 		}
 		if c.Request.Method == http.MethodGet && c.Request.URL.Path == "/v1/models" {
-			writeCatalog(c, profile)
+			g.writeCatalog(c, profile)
 			return
 		}
 		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 32<<20)
@@ -89,6 +93,23 @@ func (g *requestGate) middleware() gin.HandlerFunc {
 		if !ok {
 			writeRequestError(c, http.StatusBadRequest, "所选 profile 未开放该模型")
 			return
+		}
+		if route.unavailable != "" {
+			writeRequestError(c, http.StatusServiceUnavailable, route.unavailable)
+			return
+		}
+		if route.authType == config.AuthCodexOAuth {
+			if g.oauth == nil || !g.oauth.Healthy(route.authID) || !cliproxy.GlobalModelRegistry().ClientSupportsModel(route.authID, route.sdkModel) {
+				writeRequestError(c, http.StatusServiceUnavailable, "该 OAuth 凭证或模型不可用，请停止网关后重新登录")
+				return
+			}
+			ctx, release, err := g.oauth.Track(c.Request.Context(), route.authID)
+			if err != nil {
+				writeRequestError(c, http.StatusServiceUnavailable, "该 OAuth 凭证不可用")
+				return
+			}
+			defer release()
+			c.Request = c.Request.WithContext(ctx)
 		}
 		if err := rewriteRequestModel(c.Request, route.sdkModel); err != nil {
 			writeRequestError(c, http.StatusBadRequest, "无法解析 JSON 请求")
@@ -105,6 +126,9 @@ func (g *requestGate) middleware() gin.HandlerFunc {
 		c.Request.URL.RawQuery = query.Encode()
 
 		writer := newTransformWriter(c.Writer, route)
+		if route.authType == config.AuthCodexOAuth {
+			writer.healthy = func() bool { return g.oauth.Healthy(route.authID) }
+		}
 		c.Writer = writer
 		c.Next()
 		writer.finish()
@@ -161,7 +185,7 @@ func writeRequestError(c *gin.Context, status int, message string) {
 	}})
 }
 
-func writeCatalog(c *gin.Context, profile profileSnapshot) {
+func (g *requestGate) writeCatalog(c *gin.Context, profile profileSnapshot) {
 	type catalogModel struct {
 		ID          string `json:"id"`
 		Type        string `json:"type"`
@@ -171,6 +195,12 @@ func writeCatalog(c *gin.Context, profile profileSnapshot) {
 	}
 	data := make([]catalogModel, 0, len(profile.catalog))
 	for _, model := range profile.catalog {
+		if model.unavailable != "" {
+			continue
+		}
+		if model.authType == config.AuthCodexOAuth && (g.oauth == nil || !g.oauth.Healthy(model.authID) || !cliproxy.GlobalModelRegistry().ClientSupportsModel(model.authID, model.sdkModel)) {
+			continue
+		}
 		data = append(data, catalogModel{
 			ID: model.publicID, Type: "model", DisplayName: model.label,
 			Description: model.description, CreatedAt: time.Unix(0, 0).UTC().Format(time.RFC3339),
@@ -356,6 +386,14 @@ type transformWriter struct {
 	streamBuffer bytes.Buffer
 	written      bool
 	committed    bool
+	healthy      func() bool
+}
+
+func (w *transformWriter) checkHealth() error {
+	if w.healthy != nil && !w.healthy() {
+		return errors.New("OAuth 凭证不可用")
+	}
+	return nil
 }
 
 func newTransformWriter(base gin.ResponseWriter, route modelRoute) *transformWriter {
@@ -363,7 +401,7 @@ func newTransformWriter(base gin.ResponseWriter, route modelRoute) *transformWri
 }
 
 func (w *transformWriter) WriteHeader(code int) {
-	if w.committed {
+	if w.committed || w.checkHealth() != nil {
 		return
 	}
 	w.status = code
@@ -371,13 +409,19 @@ func (w *transformWriter) WriteHeader(code int) {
 }
 
 func (w *transformWriter) WriteHeaderNow() {
+	if w.checkHealth() != nil {
+		return
+	}
 	w.written = true
-	if w.chooseMode() == 2 {
+	if w.chooseMode() == 2 && (w.healthy == nil || w.committed) {
 		w.commitHeader()
 	}
 }
 
 func (w *transformWriter) Write(data []byte) (int, error) {
+	if err := w.checkHealth(); err != nil {
+		return 0, err
+	}
 	w.written = true
 	switch w.chooseMode() {
 	case 1:
@@ -386,7 +430,7 @@ func (w *transformWriter) Write(data []byte) (int, error) {
 		return w.writeSSE(data)
 	default:
 		w.commitHeader()
-		return w.ResponseWriter.Write(data)
+		return w.writeDownstream(data)
 	}
 }
 
@@ -411,7 +455,14 @@ func (w *transformWriter) Size() int {
 func (w *transformWriter) Written() bool { return w.written || w.ResponseWriter.Written() }
 
 func (w *transformWriter) Flush() {
+	if w.checkHealth() != nil {
+		return
+	}
 	if w.chooseMode() == 2 {
+		// OAuth 空流延后提交，避免凭证在首个事件前失效却返回空的 200。
+		if w.healthy != nil && !w.committed {
+			return
+		}
 		w.commitHeader()
 		w.ResponseWriter.Flush()
 		return
@@ -422,6 +473,9 @@ func (w *transformWriter) Flush() {
 }
 
 func (w *transformWriter) FlushError() error {
+	if err := w.checkHealth(); err != nil {
+		return err
+	}
 	w.Flush()
 	return nil
 }
@@ -444,8 +498,15 @@ func (w *transformWriter) chooseMode() int {
 	return w.mode
 }
 
+func (w *transformWriter) writeDownstream(data []byte) (int, error) {
+	if err := w.checkHealth(); err != nil {
+		return 0, err
+	}
+	return w.ResponseWriter.Write(data)
+}
+
 func (w *transformWriter) commitHeader() {
-	if w.committed {
+	if w.committed || w.checkHealth() != nil {
 		return
 	}
 	w.committed = true
@@ -454,7 +515,7 @@ func (w *transformWriter) commitHeader() {
 }
 
 func (w *transformWriter) writeSSE(data []byte) (int, error) {
-	if !w.committed {
+	if !w.committed && w.healthy == nil {
 		w.commitHeader()
 	}
 	_, _ = w.streamBuffer.Write(data)
@@ -467,10 +528,14 @@ func (w *transformWriter) writeSSE(data []byte) (int, error) {
 		event := append([]byte(nil), pending[:boundary]...)
 		separator := append([]byte(nil), pending[boundary:boundary+width]...)
 		w.streamBuffer.Next(boundary + width)
-		if _, err := w.ResponseWriter.Write(transformSSEEvent(event, w.route)); err != nil {
+		if err := w.checkHealth(); err != nil {
 			return len(data), err
 		}
-		if _, err := w.ResponseWriter.Write(separator); err != nil {
+		w.commitHeader()
+		if _, err := w.writeDownstream(transformSSEEvent(event, w.route)); err != nil {
+			return len(data), err
+		}
+		if _, err := w.writeDownstream(separator); err != nil {
 			return len(data), err
 		}
 	}
@@ -582,22 +647,44 @@ func rewriteMessageStart(data []byte, mapping map[string]string) []byte {
 	return encoded
 }
 
+func (w *transformWriter) rejectUnhealthy() bool {
+	if w.checkHealth() == nil {
+		return false
+	}
+	// JSON 尚未提交时替换为脱敏错误；已开始的 SSE 只停止后续输出，不缓冲整条流。
+	w.jsonBody.Reset()
+	w.streamBuffer.Reset()
+	if !w.ResponseWriter.Written() {
+		w.status = http.StatusServiceUnavailable
+		w.Header().Del("Content-Length")
+		w.Header().Del("Content-Encoding")
+		w.Header().Set("Content-Type", "application/json")
+		w.ResponseWriter.WriteHeader(w.status)
+		_, _ = w.ResponseWriter.Write([]byte(`{"error":{"type":"invalid_request_error","message":"该 OAuth 凭证不可用，请停止网关后重新登录"}}`))
+	}
+	return true
+}
+
 func (w *transformWriter) finish() {
+	// 提交检查期间也可能失效；未提交时不能让 net/http 默认返回空的 200。
+	defer w.rejectUnhealthy()
+	if w.rejectUnhealthy() {
+		return
+	}
 	switch w.chooseMode() {
 	case 1:
 		body := rewriteModelFields(w.jsonBody.Bytes(), responseModelMap(w.route))
 		w.Header().Del("Content-Length")
 		w.commitHeader()
-		_, _ = w.ResponseWriter.Write(body)
+		_, _ = w.writeDownstream(body)
 	case 2:
+		w.commitHeader()
 		if w.streamBuffer.Len() > 0 {
 			pending := w.streamBuffer.Bytes()
-			_, _ = w.ResponseWriter.Write(transformSSEEvent(pending, w.route))
+			_, _ = w.writeDownstream(transformSSEEvent(pending, w.route))
 			w.streamBuffer.Reset()
 		}
-		if flusher, ok := w.ResponseWriter.(interface{ Flush() }); ok {
-			flusher.Flush()
-		}
+		w.Flush()
 	case 3:
 		if !w.committed {
 			w.commitHeader()

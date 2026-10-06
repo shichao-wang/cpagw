@@ -161,8 +161,11 @@ func (s *Store) Read() (*config.State, error) {
 	if decoder.Decode(new(any)) != io.EOF {
 		return nil, fmt.Errorf("状态文件含多份 JSON，拒绝覆盖")
 	}
-	if state.SchemaVersion != 1 || state.Providers == nil || state.Profiles == nil || state.Secrets == nil {
-		return nil, fmt.Errorf("不支持或无效的状态格式")
+	if state.SchemaVersion == 1 {
+		return nil, fmt.Errorf("状态格式为 v1，请先执行 state migrate")
+	}
+	if err := state.Validate(); err != nil {
+		return nil, err
 	}
 	return state, nil
 }
@@ -173,6 +176,9 @@ func (s *Store) Update(fn func(*config.State) error) error {
 			return err
 		}
 		if err = fn(state); err != nil {
+			return err
+		}
+		if err = state.Validate(); err != nil {
 			return err
 		}
 		state.Revision++

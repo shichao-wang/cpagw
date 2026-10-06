@@ -5,8 +5,8 @@
 ## 配置模型
 
 ```text
-provider：服务提供商配置（默认上游 API key）
-  └── connection：协议、API 根地址、可选 key 覆盖、模型清单
+provider：服务提供商配置（可选默认上游 API key）
+  └── connection：协议、认证方式、API 根地址、专属凭证与模型清单
 profile：下游 Agent 的专属 key、三档模型绑定与展示
 ```
 
@@ -96,7 +96,38 @@ cpagw provider models deepseek --connection anthropic
 cpagw provider check deepseek --connection anthropic
 ```
 
-provider add 通过隐藏输入读取默认 key。非交互场景使用 `--api-key-stdin`，不要将 key 放进命令参数。connection 默认继承 provider key，使用同名选项可以独立覆盖；update 的 `--inherit-api-key` 清除覆盖。show/list 脱敏，不回显 key。
+provider add 通过隐藏输入读取默认 key。非交互场景使用 `--api-key-stdin`，不要将 key 放进命令参数。API-key connection 默认继承 provider key，使用同名选项可以独立覆盖；update 的 `--inherit-api-key` 清除覆盖。OAuth connection 不继承 provider 默认 key。show/list 仅显示认证方式与凭证就绪状态，不回显 key、凭证引用或账户标识。
+
+### Codex OAuth
+
+Codex OAuth 目前只支持 `responses` 协议和 OpenAI 官方 Codex endpoint `https://chatgpt.com/backend-api/codex`。可省略 `--base-url`，也可显式指定这个官方地址；不支持自定义 OAuth endpoint。认证通过 Codex 的设备码流程完成：命令输出官方验证页和设备码，用户在浏览器中完成授权，CLI 等待授权结果。可用 `--no-browser` 禁止 CLI 尝试打开浏览器。
+
+为 Codex OAuth 准备独立的 `codex-models.yaml`，不要复用上面 API key 示例的模型清单：
+
+```yaml
+models:
+  - id: gpt-5.5
+    name: Codex 示例模型
+```
+
+`gpt-5.5` 仅为示例，使用前请确认自己的账号实际支持该模型，并据此填写模型清单与 profile 绑定。
+
+```sh
+cpagw provider add openai --no-default-key
+cpagw provider connection add openai codex \
+  --auth-type codex-oauth \
+  --protocol responses \
+  --models codex-models.yaml
+cpagw provider connection login openai codex
+# bindings.yaml 的 opus/sonnet/haiku 均设置 provider: openai、connection: codex、target_model: gpt-5.5
+cpagw profile create codex --agent claude-code --file bindings.yaml
+cpagw server start
+cpagw profile apply codex
+cpagw server stop
+cpagw provider connection logout openai codex --yes
+```
+
+认证方式切换必须在 `provider connection update` 中显式传 `--auth-type`；切换为 API key 时还需在同一命令显式提供 `--api-key-stdin` 或 `--inherit-api-key`，不能静默继承。`login`、`logout`、重登录以及 OAuth 认证类型切换、删除 OAuth 连接/包含 OAuth 连接的 provider，均要求先停止网关；连接保留，logout 只清除本地保存的 OAuth 凭证，不代表向上游撤销授权。OAuth 凭证属于本地敏感状态，可能以明文保存但文件权限限制为 0600；请勿提交或分享状态文件。OAuth 账号可用模型取决于账号实际授权及 SDK 注册目录；模型清单只是本地声明，不保证账号支持该模型，也不意味着任意 Responses 服务兼容。OAuth 检查不会携带 access token 请求通用 `/models` endpoint。
 
 上游协议：
 
@@ -148,12 +179,13 @@ cpagw profile delete daily
 ## 本地状态与安全
 
 - 状态目录默认为 `$XDG_CONFIG_HOME/cpagw`，未设置时使用 `~/.config/cpagw`；可用 `--state-dir` 隔离。
-- 状态目录 0700、敏感文件 0600；配置、secret 引用及 secret 数据以同一原子事务保存。上游 key 和下游 profile key 分开引用，SDK 配置是私有派生数据。
+- 状态目录 0700、敏感文件 0600；配置、secret 引用及 secret 数据以同一原子事务保存。上游 key、Codex OAuth 凭证和下游 profile key 分开管理，SDK 配置是私有派生数据。
+- 当前状态格式为 schema v2。升级前停止网关，然后运行 `cpagw state migrate`；迁移按版本逐版执行，本版本提供 v1→v2 转换并在原子升级前保存受限权限备份。迁移完成后，旧 binary 不支持读取 v2 状态，需使用支持该格式的新版本。
 - 本地状态和 Claude Code 应用后的 settings 都可能含明文 key；文件权限保护不是加密保险箱。不要提交或分享这些文件。
 - 默认仅监听 loopback；后台和前台启动都会预检查监听地址，端口冲突时明确报告占用地址，不启动网关，也不停止原占用服务。预检查分两步：先探测同端口的 `127.0.0.1` 与 `::1` 是否已有服务监听，再验证地址可绑定。**只做绑定检查并不足够**——macOS 允许通配监听（如 `*:8317`）与具体 loopback 地址同时绑成功，绑定成功不能证明端口空闲。预检查会立即释放临时监听器，正式监听和实例就绪校验仍负责处理之后的端口竞争。
 - 下游只开放模型列表、Messages 及支持的 count_tokens，其他执行协议及管理入口不向 profile key 开放。
 - 模型目录隐藏不是唯一的访问控制：每次推理也严格校验 key 和公开模型绑定。
-- 当前配置更新通过网关进程内重建 SDK 服务生效，可能短暂不可用，并中断在途请求；CLI 会确认新 revision 就绪后才报告成功。SDK watcher 无中断重载是后续优化项。
+- 本地状态是配置与 OAuth 凭证的唯一事实源，SDK 配置和认证记录均为派生运行时数据。网关进程使用单个 SDK Service；结构变更在该 Service 上串行热更新，关闭请求 gate 直至新状态就绪后再报告成功。OAuth token 刷新仅做凭证条件保存，不触发结构重载；登录、退出和认证方式切换仍要求先停止网关。
 - stop 不承诺等待全部在途 SSE 完整结束。
 
 ## 验证
