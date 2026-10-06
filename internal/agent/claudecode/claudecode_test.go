@@ -21,6 +21,12 @@ func testStore(t *testing.T) *store.Store {
 		state.Listen = "127.0.0.1:8317"
 		state.Secrets["secret-a"] = "token-a"
 		state.Secrets["secret-b"] = "token-b"
+		state.Secrets["upstream-secret"] = "upstream-token"
+		state.Connections["mock"] = config.Connection{
+			Name: "mock", Protocol: config.Anthropic, BaseURL: "https://example.com",
+			CredentialRef: "upstream-secret",
+			Models:        []config.Model{{ID: "target-opus"}, {ID: "target-sonnet"}, {ID: "target-haiku"}},
+		}
 		state.Profiles["alpha"] = testProfile("alpha", "profile-a", "secret-a", "alpha")
 		state.Profiles["first"] = testProfile("first", "profile-a", "secret-a", "first")
 		state.Profiles["second"] = testProfile("second", "profile-b", "secret-b", "second")
@@ -36,6 +42,8 @@ func testProfile(name, id, keyRef, prefix string) config.Profile {
 	for _, slot := range config.Slots {
 		models[slot] = config.Binding{
 			PublicModel: "claude-" + prefix + "-" + slot,
+			Connection:  "mock",
+			TargetModel: "target-" + slot,
 			Label:       strings.ToUpper(prefix) + " " + strings.ToUpper(slot),
 			Description: "description for " + prefix + " " + slot,
 		}

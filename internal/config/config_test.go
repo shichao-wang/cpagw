@@ -14,35 +14,30 @@ func TestURLs(t *testing.T) {
 		}
 	}
 }
-func TestCredentialInheritance(t *testing.T) {
+
+func TestKeyRequiresConnectionCredential(t *testing.T) {
 	s := NewState()
-	s.Secrets["default"] = "a"
-	s.Secrets["override"] = "b"
-	s.Providers["deepseek"] = Provider{Name: "deepseek", DefaultCredentialRef: "default"}
-	c := Connection{Name: "chat"}
-	if got, err := s.Key("deepseek", c); err != nil || got != "a" {
-		t.Fatalf("默认继承失败：%s %v", got, err)
+	s.Secrets["secret"] = "valid-key"
+	s.Secrets[""] = "must-not-be-used"
+	c := Connection{Name: "model", CredentialRef: "secret"}
+	if got, err := s.Key(c); err != nil || got != "valid-key" {
+		t.Fatalf("连接 key 解析失败：%s %v", got, err)
 	}
-	c.CredentialRef = "override"
-	if got, err := s.Key("deepseek", c); err != nil || got != "b" {
-		t.Fatalf("覆盖失败：%s %v", got, err)
-	}
-	s.Secrets["default"] = "rotated"
-	if got, _ := s.Key("deepseek", c); got != "b" {
-		t.Fatal("默认轮换覆盖了独立 key")
-	}
-	c.CredentialRef = "missing"
-	if _, err := s.Key("deepseek", c); err == nil {
-		t.Fatal("缺失的覆盖 key 不应回退到默认")
+	for _, ref := range []string{"missing", "", " \t"} {
+		c.CredentialRef = ref
+		if _, err := s.Key(c); err == nil {
+			t.Fatalf("凭证引用 %q 不应回退", ref)
+		}
 	}
 }
+
 func TestProfileValidation(t *testing.T) {
 	s := NewState()
-	s.Secrets["k"] = "key"
-	s.Providers["p"] = Provider{Name: "p", DefaultCredentialRef: "k", Connections: map[string]Connection{"c": {Name: "c", Protocol: Anthropic, Models: []Model{{ID: "upstream"}}}}}
+	s.Secrets["k"] = "valid-key"
+	s.Connections["c"] = Connection{Name: "c", Protocol: Anthropic, CredentialRef: "k", Models: []Model{{ID: "upstream"}}}
 	p := Profile{Agent: "claude-code", Models: map[string]Binding{}}
 	for _, slot := range Slots {
-		p.Models[slot] = Binding{PublicModel: "claude-" + slot + "-test", Provider: "p", Connection: "c", TargetModel: "upstream"}
+		p.Models[slot] = Binding{PublicModel: "claude-" + slot + "-test", Connection: "c", TargetModel: "upstream"}
 	}
 	if err := s.ValidateProfile(p); err != nil {
 		t.Fatal(err)
@@ -52,5 +47,29 @@ func TestProfileValidation(t *testing.T) {
 	p.Models["sonnet"] = b
 	if s.ValidateProfile(p) == nil {
 		t.Fatal("重复公开 ID 不应通过")
+	}
+}
+
+func TestModelAndBindingTextRejectControlCharacters(t *testing.T) {
+	for _, models := range [][]Model{
+		{{ID: "model\nsecret"}},
+		{{ID: "model", Name: "line\tbreak"}},
+	} {
+		if ValidateModels(models) == nil {
+			t.Fatalf("应拒绝包含控制字符的模型清单：%q", models)
+		}
+	}
+	s := NewState()
+	s.Secrets["k"] = "valid-key"
+	s.Connections["c"] = Connection{Name: "c", Protocol: Chat, CredentialRef: "k", Models: []Model{{ID: "upstream"}}}
+	p := Profile{Agent: "claude-code", Models: map[string]Binding{}}
+	for _, slot := range Slots {
+		p.Models[slot] = Binding{PublicModel: "claude-" + slot, Connection: "c", TargetModel: "upstream"}
+	}
+	b := p.Models["opus"]
+	b.Label = "bad\nlabel"
+	p.Models["opus"] = b
+	if s.ValidateProfile(p) == nil {
+		t.Fatal("应拒绝包含控制字符的展示文本")
 	}
 }

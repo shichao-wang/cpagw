@@ -2,15 +2,17 @@ package cli
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/shichao-wang/cpagw/internal/config"
+	"github.com/shichao-wang/cpagw/internal/connection"
 	"github.com/shichao-wang/cpagw/internal/profile"
-	"github.com/shichao-wang/cpagw/internal/provider"
 	"github.com/shichao-wang/cpagw/internal/store"
+	"github.com/spf13/cobra"
 )
 
 func TestListAndShowNeverPrintSecretsOrReferences(t *testing.T) {
@@ -22,42 +24,31 @@ func TestListAndShowNeverPrintSecretsOrReferences(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	conn := config.Connection{
-		Name:     "default",
-		Protocol: config.Chat,
-		BaseURL:  "https://api.example.test",
-		Models:   []config.Model{{ID: "upstream-model"}},
-	}
-	if err := provider.Create(st, "example", conn, "provider-api-secret"); err != nil {
+	conn := config.Connection{Name: "default", Protocol: config.Chat, BaseURL: "https://api.example.test", Models: []config.Model{{ID: "upstream-model"}}}
+	if err := connection.Create(st, conn, "connection-api-secret"); err != nil {
 		t.Fatal(err)
 	}
 	models := map[string]config.Binding{}
 	for _, slot := range config.Slots {
-		models[slot] = config.Binding{
-			PublicModel: "claude-example-" + slot,
-			Provider:    "example",
-			Connection:  "default",
-			TargetModel: "upstream-model",
-			Label:       "model-label",
-		}
+		models[slot] = config.Binding{PublicModel: "claude-example-" + slot, Connection: "default", TargetModel: "upstream-model", Label: "model-label"}
 	}
 	profileName := "demo"
 	if _, err := profile.Create(st, profile.File{Name: &profileName, Models: models}); err != nil {
 		t.Fatal(err)
 	}
-	s, err := st.Read()
+	state, err := st.Read()
 	if err != nil {
 		t.Fatal(err)
 	}
-	profileKey := s.Secrets[s.Profiles["demo"].KeyRef]
-	keyRef := s.Profiles["demo"].KeyRef
-	providerKeyRef := s.Providers["example"].DefaultCredentialRef
+	profileKey := state.Secrets[state.Profiles["demo"].KeyRef]
+	keyRef := state.Profiles["demo"].KeyRef
+	connectionKeyRef := state.Connections["default"].CredentialRef
 
 	for _, args := range [][]string{
 		{"profile", "list"},
 		{"profile", "show", "demo"},
-		{"provider", "list"},
-		{"provider", "show", "example"},
+		{"connection", "list"},
+		{"connection", "show", "default"},
 	} {
 		root := NewCommand()
 		var output, stderr bytes.Buffer
@@ -68,7 +59,7 @@ func TestListAndShowNeverPrintSecretsOrReferences(t *testing.T) {
 			t.Fatalf("%v 执行失败：%v (%s)", args, err, stderr.String())
 		}
 		text := output.String() + stderr.String()
-		for _, secret := range []string{profileKey, "provider-api-secret", keyRef, providerKeyRef} {
+		for _, secret := range []string{profileKey, "connection-api-secret", keyRef, connectionKeyRef} {
 			if strings.Contains(text, secret) {
 				t.Fatalf("%v 输出泄漏 key 或凭证引用 %q：%s", args, secret, text)
 			}
@@ -76,21 +67,250 @@ func TestListAndShowNeverPrintSecretsOrReferences(t *testing.T) {
 	}
 }
 
-func TestApiKeyRequiresExplicitStdinInNonInteractiveMode(t *testing.T) {
+func TestLegacyProviderCommandIsRejected(t *testing.T) {
+	root := NewCommand()
+	root.SetArgs([]string{"provider", "list"})
+	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "unknown command") {
+		t.Fatalf("旧 provider 命令应被拒绝，错误为：%v", err)
+	}
+}
+
+func TestConnectionAddScriptModeRequiresAllFieldsAndExplicitStdin(t *testing.T) {
+	root := NewCommand()
+	root.SetArgs([]string{"connection", "add", "demo"})
+	root.SetIn(strings.NewReader("some-secret"))
+	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "--api-key-stdin") {
+		t.Fatalf("非交互缺参应立即报错，错误为：%v", err)
+	}
+}
+
+func TestConnectionUpdatePreservesKeyUnlessRotated(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := config.Connection{Name: "demo", Protocol: config.Chat, BaseURL: "https://old.example.test", Models: []config.Model{{ID: "old-model"}}}
+	if err := connection.Create(st, original, "old-api-secret"); err != nil {
+		t.Fatal(err)
+	}
 	modelPath := filepath.Join(t.TempDir(), "models.yaml")
-	if err := os.WriteFile(modelPath, []byte("- id: upstream-model\\n"), 0600); err != nil {
+	if err := os.WriteFile(modelPath, []byte("- id: new-model\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	root := NewCommand()
-	root.SetArgs([]string{"provider", "add", "demo"})
-	root.SetIn(strings.NewReader("some-secret"))
-	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "--api-key-stdin") {
-		t.Fatalf("非交互模式应要求明确的 stdin 标志，错误为：%v", err)
+	root.SetArgs([]string{"--state-dir", dir, "connection", "update", "demo", "--base-url", "https://new.example.test", "--models", modelPath})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("不带 key 更新失败：%v", err)
+	}
+	state, err := st.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := state.Connections["demo"]
+	if updated.BaseURL != "https://new.example.test" || updated.Models[0].ID != "new-model" || state.Secrets[updated.CredentialRef] != "old-api-secret" {
+		t.Fatalf("更新未保留预期地址、模型或 key：%+v", updated)
+	}
+
+	root = NewCommand()
+	root.SetIn(strings.NewReader("rotated-api-secret\n"))
+	root.SetArgs([]string{"--state-dir", dir, "connection", "update", "demo", "--api-key-stdin"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("key 轮换失败：%v", err)
+	}
+	state, err = st.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated = state.Connections["demo"]
+	if state.Secrets[updated.CredentialRef] != "rotated-api-secret" {
+		t.Fatal("key 轮换未生效")
+	}
+}
+
+func TestConnectionAddScriptModeKeepsSecretsOutOfOutput(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	modelPath := filepath.Join(t.TempDir(), "models.yaml")
+	if err := os.WriteFile(modelPath, []byte("- id: upstream-model\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	root := NewCommand()
+	var output, stderr bytes.Buffer
+	root.SetOut(&output)
+	root.SetErr(&stderr)
+	root.SetIn(strings.NewReader("script-api-secret\n"))
+	root.SetArgs([]string{"--state-dir", dir, "connection", "add", "demo", "--protocol", config.Chat, "--base-url", "https://api.example.test", "--models", modelPath, "--api-key-stdin"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("脚本模式添加失败：%v (%s)", err, stderr.String())
+	}
+	if text := output.String() + stderr.String(); strings.Contains(text, "script-api-secret") {
+		t.Fatalf("命令输出泄漏 key：%q", text)
+	}
+	st, err := store.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := st.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := state.Connections["demo"]
+	if state.Secrets[c.CredentialRef] != "script-api-secret" {
+		t.Fatal("连接 key 未保存")
+	}
+}
+
+type fakePrompter struct {
+	terminal     bool
+	lines        []string
+	secret       string
+	confirm      bool
+	lineErr      error
+	secretErr    error
+	lineCalls    int
+	secretCalls  int
+	confirmCalls int
+}
+
+func (p *fakePrompter) IsTerminal() bool { return p.terminal }
+func (p *fakePrompter) ReadLine(string) (string, error) {
+	p.lineCalls++
+	if p.lineErr != nil {
+		return "", p.lineErr
+	}
+	if len(p.lines) == 0 {
+		return "", errors.New("EOF")
+	}
+	line := p.lines[0]
+	p.lines = p.lines[1:]
+	return line, nil
+}
+func (p *fakePrompter) ReadSecret(string) (string, error) {
+	p.secretCalls++
+	return p.secret, p.secretErr
+}
+func (p *fakePrompter) Confirm(string) (bool, error) {
+	p.confirmCalls++
+	return p.confirm, nil
+}
+
+func TestConnectionStdinModeDoesNotEnterWizardOnTTY(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	modelPath := filepath.Join(t.TempDir(), "models.yaml")
+	if err := os.WriteFile(modelPath, []byte("- id: upstream-model\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	p := &fakePrompter{terminal: true, lines: []string{"should-not-be-read"}, secret: "ignored"}
+	root := &cobra.Command{Use: "cpagw"}
+	root.AddCommand(newConnectionCommandWithPrompter(func() (*store.Store, error) { return store.New(dir) }, Options{}, p))
+	root.SetIn(strings.NewReader("tty-script-secret\n"))
+	root.SetArgs([]string{"connection", "add", "demo", "--protocol", config.Chat, "--base-url", "https://api.example.test", "--models", modelPath, "--api-key-stdin"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("TTY 下完整 stdin 模式失败：%v", err)
+	}
+	if p.lineCalls != 0 || p.secretCalls != 0 || p.confirmCalls != 0 {
+		t.Fatalf("stdin 模式进入了交互提示：line=%d secret=%d confirm=%d", p.lineCalls, p.secretCalls, p.confirmCalls)
+	}
+
+	p = &fakePrompter{terminal: true, lines: []string{"must-not-be-consumed"}}
+	root = &cobra.Command{Use: "cpagw"}
+	root.AddCommand(newConnectionCommandWithPrompter(func() (*store.Store, error) { return store.New(dir) }, Options{}, p))
+	root.SetIn(strings.NewReader("another-secret"))
+	root.SetArgs([]string{"connection", "add", "demo", "--api-key-stdin"})
+	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "必须同时提供") {
+		t.Fatalf("TTY 下 stdin 缺少普通参数应立即失败，错误：%v", err)
+	}
+	if p.lineCalls != 0 || p.secretCalls != 0 || p.confirmCalls != 0 {
+		t.Fatalf("不完整 stdin 模式消费了交互输入：line=%d secret=%d confirm=%d", p.lineCalls, p.secretCalls, p.confirmCalls)
+	}
+}
+
+func TestConnectionWizardCreatesWithoutLeakingSecret(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	p := &fakePrompter{terminal: true, lines: []string{"demo", "1", "https://api.example.test", "1", "upstream-model=Display", ""}, secret: "wizard-api-secret", confirm: true}
+	var output, stderr bytes.Buffer
+	// 用私有命令构造器注入向导输入，避免扩大公开 Options。
+	cmd := newConnectionCommandWithPrompter(func() (*store.Store, error) { return store.New(dir) }, Options{}, p)
+	isolated := &cobra.Command{Use: "cpagw"}
+	isolated.AddCommand(cmd)
+	isolated.SetOut(&output)
+	isolated.SetErr(&stderr)
+	isolated.SetArgs([]string{"connection", "add"})
+	if err := isolated.Execute(); err != nil {
+		t.Fatalf("向导创建失败：%v (%s)", err, stderr.String())
+	}
+	if text := output.String() + stderr.String(); strings.Contains(text, "wizard-api-secret") {
+		t.Fatalf("向导输出泄漏 key：%q", text)
+	}
+	st, err := store.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := st.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Secrets[state.Connections["demo"].CredentialRef] != "wizard-api-secret" {
+		t.Fatal("向导没有保存连接 key")
+	}
+}
+
+func TestConnectionWizardCancellationAndInvalidInputDoNotSave(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		p    *fakePrompter
+	}{
+		{name: "取消确认", p: &fakePrompter{terminal: true, lines: []string{"demo", "1", "https://api.example.test", "1", "upstream-model", ""}, secret: "wizard-api-secret", confirm: false}},
+		{name: "EOF", p: &fakePrompter{terminal: true, lines: []string{"demo"}}},
+		{name: "控制字符", p: &fakePrompter{terminal: true, lines: []string{"bad\x1fname"}}},
+		{name: "无效 key", p: &fakePrompter{terminal: true, lines: []string{"demo", "1", "https://api.example.test", "1", "upstream-model", ""}, secret: "bad key", confirm: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.Chmod(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			open := func() (*store.Store, error) { return store.New(dir) }
+			root := &cobra.Command{Use: "cpagw"}
+			root.AddCommand(newConnectionCommandWithPrompter(open, Options{}, tc.p))
+			var output, stderr bytes.Buffer
+			root.SetOut(&output)
+			root.SetErr(&stderr)
+			root.SetArgs([]string{"connection", "add"})
+			if err := root.Execute(); err == nil {
+				t.Fatal("预期向导失败")
+			}
+			if tc.p.secret != "" && strings.Contains(output.String()+stderr.String(), tc.p.secret) {
+				t.Fatal("向导错误输出泄漏输入的 key")
+			}
+			st, err := store.New(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			state, err := st.Read()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(state.Connections) != 0 {
+				t.Fatalf("失败向导保存了部分状态：%v", state.Connections)
+			}
+		})
 	}
 }
 
 func TestVersionCommand(t *testing.T) {
-	// 直接构建时未注入版本，此处仅覆盖空值路径；注入路径由 formatVersion 的表驱动测试覆盖。
 	root := NewCommand()
 	var output bytes.Buffer
 	root.SetOut(&output)
@@ -105,7 +325,6 @@ func TestVersionCommand(t *testing.T) {
 }
 
 func TestVersionFlagsRejected(t *testing.T) {
-	// 不设置 root.Version，故 cobra 不注册 --version 与 -v，两者都应被拒绝。
 	for _, arg := range []string{"--version", "-v"} {
 		root := NewCommand()
 		var output bytes.Buffer
@@ -125,23 +344,9 @@ func TestFormatVersion(t *testing.T) {
 		want  []string
 		omits []string
 	}{
-		{
-			name: "全部注入",
-			info: VersionInfo{Version: "v1.2.3", Commit: "abc123", Date: "2026-10-05T19:40:00Z"},
-			want: []string{"cpagw v1.2.3", "commit: abc123", "构建时间: 2026-10-05T19:40:00Z"},
-		},
-		{
-			name:  "仅版本号时省略其余行",
-			info:  VersionInfo{Version: "v1.2.3"},
-			want:  []string{"cpagw v1.2.3"},
-			omits: []string{"commit:", "构建时间:"},
-		},
-		{
-			name:  "均未注入",
-			info:  VersionInfo{},
-			want:  []string{"cpagw unknown"},
-			omits: []string{"commit:", "构建时间:"},
-		},
+		{name: "全部注入", info: VersionInfo{Version: "v1.2.3", Commit: "abc123", Date: "2026-10-05T19:40:00Z"}, want: []string{"cpagw v1.2.3", "commit: abc123", "构建时间: 2026-10-05T19:40:00Z"}},
+		{name: "仅版本号时省略其余行", info: VersionInfo{Version: "v1.2.3"}, want: []string{"cpagw v1.2.3"}, omits: []string{"commit:", "构建时间:"}},
+		{name: "均未注入", info: VersionInfo{}, want: []string{"cpagw unknown"}, omits: []string{"commit:", "构建时间:"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

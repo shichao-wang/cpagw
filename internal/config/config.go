@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"unicode"
 )
 
 const (
@@ -26,17 +27,11 @@ type Connection struct {
 	Name          string  `json:"name"`
 	Protocol      string  `json:"protocol"`
 	BaseURL       string  `json:"baseURL"`
-	CredentialRef string  `json:"credentialRef,omitempty"`
+	CredentialRef string  `json:"credentialRef"`
 	Models        []Model `json:"models"`
-}
-type Provider struct {
-	Name                 string                `json:"name"`
-	DefaultCredentialRef string                `json:"defaultCredentialRef,omitempty"`
-	Connections          map[string]Connection `json:"connections"`
 }
 type Binding struct {
 	PublicModel string `json:"public_model" yaml:"public_model"`
-	Provider    string `json:"provider" yaml:"provider"`
 	Connection  string `json:"connection" yaml:"connection"`
 	TargetModel string `json:"target_model" yaml:"target_model"`
 	Label       string `json:"label" yaml:"label"`
@@ -50,16 +45,16 @@ type Profile struct {
 	Models map[string]Binding `json:"models"`
 }
 type State struct {
-	SchemaVersion int                 `json:"schemaVersion"`
-	Revision      uint64              `json:"revision"`
-	Listen        string              `json:"listen"`
-	Providers     map[string]Provider `json:"providers"`
-	Profiles      map[string]Profile  `json:"profiles"`
-	Secrets       map[string]string   `json:"secrets"`
+	SchemaVersion int                   `json:"schemaVersion"`
+	Revision      uint64                `json:"revision"`
+	Listen        string                `json:"listen"`
+	Connections   map[string]Connection `json:"connections"`
+	Profiles      map[string]Profile    `json:"profiles"`
+	Secrets       map[string]string     `json:"secrets"`
 }
 
 func NewState() *State {
-	return &State{SchemaVersion: 1, Listen: "127.0.0.1:8317", Providers: map[string]Provider{}, Profiles: map[string]Profile{}, Secrets: map[string]string{}}
+	return &State{SchemaVersion: 2, Listen: "127.0.0.1:8317", Connections: map[string]Connection{}, Profiles: map[string]Profile{}, Secrets: map[string]string{}}
 }
 func RandomID() (string, error) {
 	var b [32]byte
@@ -88,18 +83,13 @@ func ValidateURL(raw string) error {
 	}
 	return nil
 }
-func (s *State) Key(provider string, c Connection) (string, error) {
-	p, ok := s.Providers[provider]
-	if !ok {
-		return "", fmt.Errorf("提供商不存在：%s", provider)
+func (s *State) Key(c Connection) (string, error) {
+	if strings.TrimSpace(c.CredentialRef) == "" {
+		return "", fmt.Errorf("连接 %s 缺少有效的 API key", c.Name)
 	}
-	ref := c.CredentialRef
-	if ref == "" {
-		ref = p.DefaultCredentialRef
-	}
-	key := s.Secrets[ref]
+	key := s.Secrets[c.CredentialRef]
 	if err := ValidateKey(key); err != nil {
-		return "", fmt.Errorf("连接 %s/%s 缺少有效的 API key", provider, c.Name)
+		return "", fmt.Errorf("连接 %s 缺少有效的 API key", c.Name)
 	}
 	return key, nil
 }
@@ -109,8 +99,8 @@ func ValidateModels(models []Model) error {
 	}
 	seen := map[string]bool{}
 	for _, m := range models {
-		if strings.TrimSpace(m.ID) == "" || strings.ContainsAny(m.ID, "\r\n") || seen[m.ID] {
-			return fmt.Errorf("模型 ID 为空、重复或无效")
+		if strings.TrimSpace(m.ID) == "" || hasControl(m.ID) || hasControl(m.Name) || seen[m.ID] {
+			return fmt.Errorf("模型 ID 为空、重复或包含控制字符")
 		}
 		seen[m.ID] = true
 	}
@@ -129,16 +119,15 @@ func (s *State) ValidateProfile(p Profile) error {
 		if !ok || !strings.HasPrefix(b.PublicModel, "claude-") || seen[b.PublicModel] {
 			return fmt.Errorf("%s 缺少唯一的公开 Claude 模型 ID", slot)
 		}
+		if hasControl(b.PublicModel) || hasControl(b.TargetModel) || hasControl(b.Label) || hasControl(b.Description) {
+			return fmt.Errorf("profile 模型信息不能包含控制字符")
+		}
 		seen[b.PublicModel] = true
-		provider, ok := s.Providers[b.Provider]
+		c, ok := s.Connections[b.Connection]
 		if !ok {
-			return fmt.Errorf("提供商不存在：%s", b.Provider)
+			return fmt.Errorf("连接不存在：%s", b.Connection)
 		}
-		c, ok := provider.Connections[b.Connection]
-		if !ok {
-			return fmt.Errorf("连接不存在：%s/%s", b.Provider, b.Connection)
-		}
-		if _, err := s.Key(b.Provider, c); err != nil {
+		if _, err := s.Key(c); err != nil {
 			return err
 		}
 		found := false
@@ -154,15 +143,23 @@ func (s *State) ValidateProfile(p Profile) error {
 	}
 	return nil
 }
-func (s *State) References(provider, connection, model string) []string {
+func (s *State) References(connectionName, targetModel string) []string {
 	var names []string
 	for name, p := range s.Profiles {
 		for _, b := range p.Models {
-			if b.Provider == provider && (connection == "" || b.Connection == connection) && (model == "" || b.TargetModel == model) {
+			if b.Connection == connectionName && (targetModel == "" || b.TargetModel == targetModel) {
 				names = append(names, name)
 				break
 			}
 		}
 	}
 	return names
+}
+func hasControl(value string) bool {
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return true
+		}
+	}
+	return false
 }

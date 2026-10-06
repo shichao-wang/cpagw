@@ -76,6 +76,7 @@ func TestGatewayRoutesByProfileAndUpstreamProtocol(t *testing.T) {
 	type observed struct {
 		kind  string
 		path  string
+		host  string
 		key   string
 		model string
 	}
@@ -92,7 +93,7 @@ func TestGatewayRoutesByProfileAndUpstreamProtocol(t *testing.T) {
 			if key == "" {
 				key = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 			}
-			observedRequests <- observed{kind: kind, path: r.URL.Path, key: key, model: payload.Model}
+			observedRequests <- observed{kind: kind, path: r.URL.Path, host: r.Host, key: key, model: payload.Model}
 			w.Header().Set("Content-Type", "application/json")
 			switch kind {
 			case "anthropic":
@@ -110,10 +111,14 @@ func TestGatewayRoutesByProfileAndUpstreamProtocol(t *testing.T) {
 	chatB := newUpstream("chat")
 	anthropic := newUpstream("anthropic")
 	responses := newUpstream("responses")
+	anthropicB := newUpstream("anthropic")
+	responsesB := newUpstream("responses")
 	defer chatA.Close()
 	defer chatB.Close()
 	defer anthropic.Close()
 	defer responses.Close()
+	defer anthropicB.Close()
+	defer responsesB.Close()
 
 	listen, err := reserveLoopbackAddress(t)
 	if err != nil {
@@ -124,6 +129,18 @@ func TestGatewayRoutesByProfileAndUpstreamProtocol(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := testState(listen, chatA.URL, chatB.URL, anthropic.URL, responses.URL)
+	state.Secrets["anthropic-b"] = "anthropic-key-b"
+	state.Secrets["responses-b"] = "responses-key-b"
+	state.Connections["anthropic-b"] = config.Connection{Name: "anthropic-b", Protocol: config.Anthropic, BaseURL: anthropicB.URL, CredentialRef: "anthropic-b", Models: []config.Model{{ID: "anthropic-target", Name: "Anthropic target"}}}
+	state.Connections["responses-b"] = config.Connection{Name: "responses-b", Protocol: config.Responses, BaseURL: responsesB.URL, CredentialRef: "responses-b", Models: []config.Model{{ID: "responses-target", Name: "Responses target"}}}
+	beta := state.Profiles["beta"]
+	sonnet := beta.Models["sonnet"]
+	sonnet.Connection = "anthropic-b"
+	beta.Models["sonnet"] = sonnet
+	haiku := beta.Models["haiku"]
+	haiku.Connection = "responses-b"
+	beta.Models["haiku"] = haiku
+	state.Profiles["beta"] = beta
 	if err := st.Update(func(current *config.State) error {
 		*current = *state
 		return nil
@@ -201,11 +218,14 @@ func TestGatewayRoutesByProfileAndUpstreamProtocol(t *testing.T) {
 		kind    string
 		upKey   string
 		upModel string
+		upURL   string
 	}{
-		{profile: "alpha", key: "alpha-client-secret", model: "claude-opus-test", kind: "chat", upKey: "chat-key-a", upModel: "shared-target"},
-		{profile: "beta", key: "beta-client-secret", model: "claude-opus-test", kind: "chat", upKey: "chat-key-b", upModel: "shared-target"},
-		{profile: "alpha", key: "alpha-client-secret", model: "claude-sonnet-test", kind: "anthropic", upKey: "anthropic-key", upModel: "anthropic-target"},
-		{profile: "alpha", key: "alpha-client-secret", model: "claude-haiku-test", kind: "responses", upKey: "responses-key", upModel: "responses-target"},
+		{profile: "alpha", key: "alpha-client-secret", model: "claude-opus-test", kind: "chat", upKey: "chat-key-a", upModel: "shared-target", upURL: chatA.URL},
+		{profile: "beta", key: "beta-client-secret", model: "claude-opus-test", kind: "chat", upKey: "chat-key-b", upModel: "shared-target", upURL: chatB.URL},
+		{profile: "alpha", key: "alpha-client-secret", model: "claude-sonnet-test", kind: "anthropic", upKey: "anthropic-key", upModel: "anthropic-target", upURL: anthropic.URL},
+		{profile: "beta", key: "beta-client-secret", model: "claude-sonnet-test", kind: "anthropic", upKey: "anthropic-key-b", upModel: "anthropic-target", upURL: anthropicB.URL},
+		{profile: "alpha", key: "alpha-client-secret", model: "claude-haiku-test", kind: "responses", upKey: "responses-key", upModel: "responses-target", upURL: responses.URL},
+		{profile: "beta", key: "beta-client-secret", model: "claude-haiku-test", kind: "responses", upKey: "responses-key-b", upModel: "responses-target", upURL: responsesB.URL},
 	} {
 		t.Run(test.profile+"/"+test.model, func(t *testing.T) {
 			response := postMessages(t, client, listen, test.key, test.model)
@@ -227,8 +247,9 @@ func TestGatewayRoutesByProfileAndUpstreamProtocol(t *testing.T) {
 			}
 			select {
 			case got := <-observedRequests:
-				if got.kind != test.kind || got.key != test.upKey || got.model != test.upModel {
-					t.Fatalf("upstream route = %+v, want kind=%q key=%q model=%q", got, test.kind, test.upKey, test.upModel)
+				wantHost := strings.TrimPrefix(test.upURL, "http://")
+				if got.kind != test.kind || got.host != wantHost || got.key != test.upKey || got.model != test.upModel {
+					t.Fatalf("上游路由隔离失败：protocol=%q host=%q model=%q key匹配=%t；期望protocol=%q host=%q model=%q", got.kind, got.host, got.model, got.key == test.upKey, test.kind, wantHost, test.upModel)
 				}
 			case <-time.After(2 * time.Second):
 				t.Fatal("mock upstream did not receive a request")
@@ -275,37 +296,68 @@ func testState(listen, chatA, chatB, anthropic, responses string) *config.State 
 	shared := []config.Model{{ID: "shared-target", Name: "Shared target"}}
 	anthropicModels := []config.Model{{ID: "anthropic-target", Name: "Anthropic target"}}
 	responsesModels := []config.Model{{ID: "responses-target", Name: "Responses target"}}
-	state.Providers = map[string]config.Provider{
-		"chat-provider": {Name: "Chat", Connections: map[string]config.Connection{
-			"connection-a": {Name: "connection-a", Protocol: config.Chat, BaseURL: chatA, CredentialRef: "chat-a", Models: shared},
-			"connection-b": {Name: "connection-b", Protocol: config.Chat, BaseURL: chatB, CredentialRef: "chat-b", Models: shared},
-		}},
-		"anthropic-provider": {Name: "Anthropic", Connections: map[string]config.Connection{
-			"connection": {Name: "connection", Protocol: config.Anthropic, BaseURL: anthropic, CredentialRef: "anthropic", Models: anthropicModels},
-		}},
-		"responses-provider": {Name: "Responses", Connections: map[string]config.Connection{
-			"connection": {Name: "connection", Protocol: config.Responses, BaseURL: responses, CredentialRef: "responses", Models: responsesModels},
-		}},
+	state.Connections = map[string]config.Connection{
+		"chat-a":    {Name: "chat-a", Protocol: config.Chat, BaseURL: chatA, CredentialRef: "chat-a", Models: shared},
+		"chat-b":    {Name: "chat-b", Protocol: config.Chat, BaseURL: chatB, CredentialRef: "chat-b", Models: shared},
+		"anthropic": {Name: "anthropic", Protocol: config.Anthropic, BaseURL: anthropic, CredentialRef: "anthropic", Models: anthropicModels},
+		"responses": {Name: "responses", Protocol: config.Responses, BaseURL: responses, CredentialRef: "responses", Models: responsesModels},
 	}
 	state.Profiles = map[string]config.Profile{
 		"alpha": {
 			Name: "alpha", ID: "profile-alpha", Agent: "claude-code", KeyRef: "alpha-key",
 			Models: map[string]config.Binding{
-				"opus":   {PublicModel: "claude-opus-test", Provider: "chat-provider", Connection: "connection-a", TargetModel: "shared-target", Label: "Alpha Opus", Description: "Alpha chat route"},
-				"sonnet": {PublicModel: "claude-sonnet-test", Provider: "anthropic-provider", Connection: "connection", TargetModel: "anthropic-target", Label: "Alpha Sonnet", Description: "Alpha Anthropic route"},
-				"haiku":  {PublicModel: "claude-haiku-test", Provider: "responses-provider", Connection: "connection", TargetModel: "responses-target", Label: "Alpha Haiku", Description: "Alpha Responses route"},
+				"opus":   {PublicModel: "claude-opus-test", Connection: "chat-a", TargetModel: "shared-target", Label: "Alpha Opus", Description: "Alpha chat route"},
+				"sonnet": {PublicModel: "claude-sonnet-test", Connection: "anthropic", TargetModel: "anthropic-target", Label: "Alpha Sonnet", Description: "Alpha Anthropic route"},
+				"haiku":  {PublicModel: "claude-haiku-test", Connection: "responses", TargetModel: "responses-target", Label: "Alpha Haiku", Description: "Alpha Responses route"},
 			},
 		},
 		"beta": {
 			Name: "beta", ID: "profile-beta", Agent: "claude-code", KeyRef: "beta-key",
 			Models: map[string]config.Binding{
-				"opus":   {PublicModel: "claude-opus-test", Provider: "chat-provider", Connection: "connection-b", TargetModel: "shared-target", Label: "Beta Opus", Description: "Beta chat route"},
-				"sonnet": {PublicModel: "claude-sonnet-test", Provider: "anthropic-provider", Connection: "connection", TargetModel: "anthropic-target", Label: "Beta Sonnet", Description: "Beta Anthropic route"},
-				"haiku":  {PublicModel: "claude-haiku-test", Provider: "responses-provider", Connection: "connection", TargetModel: "responses-target", Label: "Beta Haiku", Description: "Beta Responses route"},
+				"opus":   {PublicModel: "claude-opus-test", Connection: "chat-b", TargetModel: "shared-target", Label: "Beta Opus", Description: "Beta chat route"},
+				"sonnet": {PublicModel: "claude-sonnet-test", Connection: "anthropic", TargetModel: "anthropic-target", Label: "Beta Sonnet", Description: "Beta Anthropic route"},
+				"haiku":  {PublicModel: "claude-haiku-test", Connection: "responses", TargetModel: "responses-target", Label: "Beta Haiku", Description: "Beta Responses route"},
 			},
 		},
 	}
 	return state
+}
+
+func TestConnectionsWithSameEndpointAndKeyKeepDistinctIdentity(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := config.NewState()
+	state.Secrets["upstream"] = "same-upstream-key"
+	state.Secrets["profile"] = "profile-client-key"
+	models := []config.Model{{ID: "shared-model", Name: "Shared model"}}
+	state.Connections["same-a"] = config.Connection{Name: "same-a", Protocol: config.Chat, BaseURL: "https://example.com", CredentialRef: "upstream", Models: models}
+	state.Connections["same-b"] = config.Connection{Name: "same-b", Protocol: config.Chat, BaseURL: "https://example.com", CredentialRef: "upstream", Models: models}
+	state.Profiles["alpha"] = config.Profile{
+		Name: "alpha", ID: "profile-alpha", Agent: "claude-code", KeyRef: "profile",
+		Models: map[string]config.Binding{
+			"opus":   {PublicModel: "claude-opus-test", Connection: "same-a", TargetModel: "shared-model"},
+			"sonnet": {PublicModel: "claude-sonnet-test", Connection: "same-b", TargetModel: "shared-model"},
+			"haiku":  {PublicModel: "claude-haiku-test", Connection: "same-a", TargetModel: "shared-model"},
+		},
+	}
+	compiled, err := compile(state, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := compiled.config.OpenAICompatibility
+	if len(entries) != 2 {
+		t.Fatalf("相同地址与key仍必须编译为两个独立连接，实际为%d个", len(entries))
+	}
+	if entries[0].Name == entries[1].Name || entries[0].Name != entries[0].Prefix || entries[1].Name != entries[1].Prefix {
+		t.Fatal("连接身份必须由名称隔离，SDK名称须与各自的前缀一致")
+	}
+	for _, entry := range entries {
+		if entry.BaseURL != "https://example.com" || len(entry.APIKeyEntries) != 1 || entry.APIKeyEntries[0].APIKey != "same-upstream-key" {
+			t.Fatal("连接的凭证或地址发生了意外变化")
+		}
+	}
 }
 
 func reserveLoopbackAddress(t *testing.T) (string, error) {
@@ -324,15 +376,19 @@ func reserveLoopbackAddress(t *testing.T) (string, error) {
 func waitForReady(t *testing.T, st *store.Store) RuntimeState {
 	t.Helper()
 	deadline := time.After(10 * time.Second)
+	var last RuntimeState
 	client := &http.Client{Timeout: 500 * time.Millisecond, Transport: &http.Transport{Proxy: nil}}
 	defer client.CloseIdleConnections()
 	for {
 		select {
 		case <-deadline:
-			t.Fatal("gateway did not become ready")
+			t.Fatalf("gateway did not become ready: %+v", last)
 		default:
 		}
 		runtimeState, err := decodeRuntime(st)
+		if err == nil {
+			last = runtimeState
+		}
 		if err == nil && runtimeState.Ready {
 			request, _ := http.NewRequest(http.MethodGet, "http://"+runtimeState.Listen+ReadyPath, nil)
 			request.Header.Set(probeHeader, runtimeState.ProbeToken)

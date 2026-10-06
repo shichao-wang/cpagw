@@ -20,6 +20,8 @@ type Options struct {
 	ProfileReferenced func(profileID string) (bool, error)
 }
 
+type storeFactory func() (*store.Store, error)
+
 // VersionInfo 保存构建时注入的版本信息，供 version 命令输出。
 type VersionInfo struct {
 	Version string
@@ -91,7 +93,7 @@ func NewCommandWithOptions(opts Options) *cobra.Command {
 	root.PersistentFlags().StringVar(&stateDir, "state-dir", "", "状态目录（默认：$XDG_CONFIG_HOME/cpagw 或 ~/.config/cpagw）")
 	root.AddCommand(newVersionCommand())
 	root.AddCommand(newUpgradeCommand(upgrade.Run))
-	root.AddCommand(newProviderCommand(func() (*store.Store, error) { return store.New(stateDir) }, opts))
+	root.AddCommand(newConnectionCommand(func() (*store.Store, error) { return store.New(stateDir) }, opts))
 	root.AddCommand(newProfileCommand(func() (*store.Store, error) { return store.New(stateDir) }, opts))
 	return root
 }

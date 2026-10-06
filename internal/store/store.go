@@ -156,13 +156,13 @@ func (s *Store) Read() (*config.State, error) {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err = decoder.Decode(state); err != nil {
-		return nil, fmt.Errorf("状态文件损坏或包含未知字段，拒绝覆盖")
+		return nil, fmt.Errorf("状态文件不兼容、损坏或包含未知字段，拒绝覆盖；旧状态请使用新的 --state-dir 重新配置")
 	}
 	if decoder.Decode(new(any)) != io.EOF {
 		return nil, fmt.Errorf("状态文件含多份 JSON，拒绝覆盖")
 	}
-	if state.SchemaVersion != 1 || state.Providers == nil || state.Profiles == nil || state.Secrets == nil {
-		return nil, fmt.Errorf("不支持或无效的状态格式")
+	if state.SchemaVersion != 2 || state.Connections == nil || state.Profiles == nil || state.Secrets == nil {
+		return nil, fmt.Errorf("状态格式不兼容或无效；旧状态不会被修改，请使用新的 --state-dir 重新配置")
 	}
 	return state, nil
 }

@@ -5,12 +5,13 @@
 ## 配置模型
 
 ```text
-provider：服务提供商配置（默认上游 API key）
-  └── connection：协议、API 根地址、可选 key 覆盖、模型清单
-profile：下游 Agent 的专属 key、三档模型绑定与展示
+connection：独立上游连接（协议、API 根地址、自己的 API key、模型清单）
+profile：下游 Agent 的专属 key、三档 connection/实际模型绑定与展示
 ```
 
-提供商名称不决定协议。例如一个 `deepseek` provider 可以配置 Chat Completions、Anthropic Messages 和 Responses 三个 connection。每个 profile 的 Opus、Sonnet、Haiku 档位明确选择 provider、connection 和实际模型 ID。
+接入只需创建一个 connection，不需要先创建 provider。每个连接独立选择协议和凭证，名称不决定协议。每个 profile 的 Opus、Sonnet、Haiku 档位直接选择 connection 和实际模型 ID；多个档位可以使用同一连接。
+
+**这是不兼容旧配置的结构调整。** 当前只支持 schema 2，不保留 `provider` 命令、旧 profile 的 `provider` 字段或 schema 1 转换。旧状态会明确报错，且不会被覆盖。已有配置的用户应先用原版本执行 restore、停止旧服务，再用新的 `--state-dir` 重新接入；不要让旧、新版本共享状态目录。
 
 下游公开模型 ID 保持为 Claude ID。不同 profile 可以使用相同公开 ID，但展示不同名称并路由到不同上游。
 
@@ -71,9 +72,18 @@ Release 不是预发布版，因此 `/releases/latest` 始终指向最新一次�
 git tag v2026.10.5-abc123 && git push origin refs/tags/v2026.10.5-abc123
 ```
 
-## 接入提供商
+## 接入上游
 
-准备模型清单（必须填写上游真实支持的模型 ID）：
+交互接入只需一条命令：
+
+```sh
+cpagw connection add
+# 也可以先指定名称：cpagw connection add example
+```
+
+向导依次收集连接名称、协议、API 根地址、隐藏输入的 key 和模型清单，确认后一次保存。模型可以直接输入 ID 与可选展示名，也可以从 YAML 文件读取；不必先创建模型文件。添加默认不联网、不发模型请求。
+
+脚本接入先准备模型清单（必须填写上游真实支持的模型 ID）：
 
 ```yaml
 models:
@@ -85,18 +95,21 @@ models:
     name: 快速模型
 ```
 
+将 key 从标准输入传入，不要将其放进命令参数或 shell 历史：
+
 ```sh
-cpagw provider add deepseek
-cpagw provider connection add deepseek anthropic \
+# 从安全的凭证来源提供 stdin；不要在命令中硬编码 key。
+cpagw connection add example \
   --protocol anthropic-messages \
-  --base-url https://api.deepseek.com/anthropic \
-  --models models.yaml
-cpagw provider show deepseek
-cpagw provider models deepseek --connection anthropic
-cpagw provider check deepseek --connection anthropic
+  --base-url https://api.example.com \
+  --models models.yaml \
+  --api-key-stdin
+cpagw connection show example
+cpagw connection models example
+cpagw connection check example
 ```
 
-provider add 通过隐藏输入读取默认 key。非交互场景使用 `--api-key-stdin`，不要将 key 放进命令参数。connection 默认继承 provider key，使用同名选项可以独立覆盖；update 的 `--inherit-api-key` 清除覆盖。show/list 脱敏，不回显 key。
+非交互模式必须提供完整参数和 `--api-key-stdin`，缺参会报错而不会等待向导。每个连接持有自己的 key，不存在继承或隐藏的 provider。show/list 不回显 key 或凭证引用。
 
 上游协议：
 
@@ -135,15 +148,14 @@ restore **仅对有有效 cpagw 接管记录的配置执行**。它恢复首次�
 ## 更新与删除
 
 ```sh
-cpagw provider update deepseek --api-key-stdin
-cpagw provider connection update deepseek anthropic --models models.yaml
-cpagw provider connection update deepseek anthropic --inherit-api-key
-cpagw provider connection remove deepseek anthropic
-cpagw provider remove deepseek
+cpagw connection update example --api-key-stdin
+cpagw connection update example --models models.yaml
+cpagw connection update example --base-url https://api.example.com
+cpagw connection remove example
 cpagw profile delete daily
 ```
 
-更新默认 key 只影响继承连接，不覆盖连接自己的 key。删除 provider/connection 或移除模型前检查 profile 引用，存在引用时拒绝。被活动 apply 记录引用的 profile 需先 restore 或切换到其他 profile。
+更新未指定 key 时保留连接的原凭证；地址、模型与 key 同时修改时按同一事务保存。轮换只影响目标连接。删除连接或移除模型前检查 profile 引用，存在引用时拒绝。被活动 apply 记录引用的 profile 需先 restore 或切换到其他 profile；解除 profile 对连接的引用后才能删除连接。非交互删除需提供 `--yes`。
 
 ## 本地状态与安全
 

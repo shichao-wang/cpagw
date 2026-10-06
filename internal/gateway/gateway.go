@@ -443,14 +443,13 @@ func compile(state *config.State, st *store.Store) (*snapshot, error) {
 		ps := profileSnapshot{name: name, id: profile.ID, models: make(map[string]modelRoute, len(profile.Models))}
 		for _, slot := range config.Slots {
 			binding := profile.Models[slot]
-			provider := state.Providers[binding.Provider]
-			connection := provider.Connections[binding.Connection]
-			connectionKey := binding.Provider + "\x00" + binding.Connection
+			connection := state.Connections[binding.Connection]
+			connectionKey := binding.Connection
 			info, exists := connections[connectionKey]
 			if !exists {
-				prefix := uniquePrefix(binding.Provider, binding.Connection)
-				info = connectionInfo{provider: binding.Provider, name: binding.Connection, prefix: prefix, protocol: connection.Protocol, baseURL: connection.BaseURL, apiKey: ""}
-				info.apiKey, err = state.Key(binding.Provider, connection)
+				prefix := uniquePrefix(binding.Connection)
+				info = connectionInfo{name: binding.Connection, prefix: prefix, protocol: connection.Protocol, baseURL: connection.BaseURL}
+				info.apiKey, err = state.Key(connection)
 				if err != nil {
 					return nil, err
 				}
@@ -474,7 +473,6 @@ func compile(state *config.State, st *store.Store) (*snapshot, error) {
 }
 
 type connectionInfo struct {
-	provider string
 	name     string
 	prefix   string
 	protocol string
@@ -484,10 +482,10 @@ type connectionInfo struct {
 
 func appendSDKConnection(cfg *sdkconfig.Config, info connectionInfo, models []config.Model) error {
 	if strings.TrimSpace(info.baseURL) == "" {
-		return fmt.Errorf("连接 %s/%s 缺少 API 根地址", info.provider, info.name)
+		return fmt.Errorf("连接 %s 缺少 API 根地址", info.name)
 	}
 	if err := config.ValidateURL(info.baseURL); err != nil {
-		return fmt.Errorf("连接 %s/%s 地址无效：%w", info.provider, info.name, err)
+		return fmt.Errorf("连接 %s 地址无效：%w", info.name, err)
 	}
 	switch info.protocol {
 	case config.Anthropic:
@@ -513,13 +511,13 @@ func appendSDKConnection(cfg *sdkconfig.Config, info connectionInfo, models []co
 		}
 		cfg.OpenAICompatibility = append(cfg.OpenAICompatibility, entry)
 	default:
-		return fmt.Errorf("连接 %s/%s 的上游协议不受支持：%s", info.provider, info.name, info.protocol)
+		return fmt.Errorf("连接 %s 的上游协议不受支持：%s", info.name, info.protocol)
 	}
 	return nil
 }
 
-func uniquePrefix(provider, connection string) string {
-	sum := sha256.Sum256([]byte(provider + "\x00" + connection))
+func uniquePrefix(connection string) string {
+	sum := sha256.Sum256([]byte(connection))
 	return "cpagw-" + hex.EncodeToString(sum[:8])
 }
 
