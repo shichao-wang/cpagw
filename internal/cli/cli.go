@@ -9,6 +9,7 @@ import (
 
 	"github.com/shichao-wang/cpagw/internal/config"
 	"github.com/shichao-wang/cpagw/internal/store"
+	"github.com/shichao-wang/cpagw/internal/upgrade"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -89,6 +90,7 @@ func NewCommandWithOptions(opts Options) *cobra.Command {
 	// 本工具只用 version 子命令，避免两套入口输出不一致。
 	root.PersistentFlags().StringVar(&stateDir, "state-dir", "", "状态目录（默认：$XDG_CONFIG_HOME/cpagw 或 ~/.config/cpagw）")
 	root.AddCommand(newVersionCommand())
+	root.AddCommand(newUpgradeCommand(upgrade.Run))
 	root.AddCommand(newProviderCommand(func() (*store.Store, error) { return store.New(stateDir) }, opts))
 	root.AddCommand(newProfileCommand(func() (*store.Store, error) { return store.New(stateDir) }, opts))
 	return root
