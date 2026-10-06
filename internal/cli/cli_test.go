@@ -2,7 +2,9 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,7 +27,7 @@ func TestListAndShowNeverPrintSecretsOrReferences(t *testing.T) {
 		t.Fatal(err)
 	}
 	conn := config.Connection{Name: "default", Protocol: config.Chat, BaseURL: "https://api.example.test", Models: []config.Model{{ID: "upstream-model"}}}
-	if err := connection.Create(st, conn, "connection-api-secret"); err != nil {
+	if err := connection.Create(context.Background(), st, conn, "connection-api-secret"); err != nil {
 		t.Fatal(err)
 	}
 	models := map[string]config.Binding{}
@@ -94,7 +96,7 @@ func TestConnectionUpdatePreservesKeyUnlessRotated(t *testing.T) {
 		t.Fatal(err)
 	}
 	original := config.Connection{Name: "demo", Protocol: config.Chat, BaseURL: "https://old.example.test", Models: []config.Model{{ID: "old-model"}}}
-	if err := connection.Create(st, original, "old-api-secret"); err != nil {
+	if err := connection.Create(context.Background(), st, original, "old-api-secret"); err != nil {
 		t.Fatal(err)
 	}
 	modelPath := filepath.Join(t.TempDir(), "models.yaml")
@@ -167,36 +169,57 @@ func TestConnectionAddScriptModeKeepsSecretsOutOfOutput(t *testing.T) {
 }
 
 type fakePrompter struct {
-	terminal     bool
-	lines        []string
-	secret       string
-	confirm      bool
-	lineErr      error
-	secretErr    error
-	lineCalls    int
-	secretCalls  int
-	confirmCalls int
+	terminal       bool
+	lines          []string
+	selections     []string
+	secret         string
+	confirm        bool
+	lineErr        error
+	secretErr      error
+	selectErr      error
+	lineCalls      int
+	secretCalls    int
+	selectCalls    int
+	confirmCalls   int
+	selectedMenus  [][]promptOption
+	selectionTitle []string
 }
 
 func (p *fakePrompter) IsTerminal() bool { return p.terminal }
-func (p *fakePrompter) ReadLine(string) (string, error) {
+func (p *fakePrompter) ReadLine(_ context.Context, _ string) (string, error) {
 	p.lineCalls++
 	if p.lineErr != nil {
 		return "", p.lineErr
 	}
 	if len(p.lines) == 0 {
-		return "", errors.New("EOF")
+		return "", io.EOF
 	}
 	line := p.lines[0]
 	p.lines = p.lines[1:]
 	return line, nil
 }
-func (p *fakePrompter) ReadSecret(string) (string, error) {
+func (p *fakePrompter) ReadSecret(_ context.Context, _ string) (string, error) {
 	p.secretCalls++
 	return p.secret, p.secretErr
 }
-func (p *fakePrompter) Confirm(string) (bool, error) {
+func (p *fakePrompter) Select(_ context.Context, title string, options []promptOption) (string, error) {
+	p.selectCalls++
+	p.selectionTitle = append(p.selectionTitle, title)
+	p.selectedMenus = append(p.selectedMenus, append([]promptOption(nil), options...))
+	if p.selectErr != nil {
+		return "", p.selectErr
+	}
+	if len(p.selections) == 0 {
+		return "", io.EOF
+	}
+	value := p.selections[0]
+	p.selections = p.selections[1:]
+	return value, nil
+}
+func (p *fakePrompter) Confirm(_ context.Context, _ string) (bool, error) {
 	p.confirmCalls++
+	p.selectionTitle = append(p.selectionTitle, "确认")
+	p.selectedMenus = append(p.selectedMenus, []promptOption{{label: "取消", value: "false"}, {label: "确认", value: "true"}})
 	return p.confirm, nil
 }
 
@@ -217,7 +240,7 @@ func TestConnectionStdinModeDoesNotEnterWizardOnTTY(t *testing.T) {
 	if err := root.Execute(); err != nil {
 		t.Fatalf("TTY 下完整 stdin 模式失败：%v", err)
 	}
-	if p.lineCalls != 0 || p.secretCalls != 0 || p.confirmCalls != 0 {
+	if p.lineCalls != 0 || p.secretCalls != 0 || p.selectCalls != 0 || p.confirmCalls != 0 {
 		t.Fatalf("stdin 模式进入了交互提示：line=%d secret=%d confirm=%d", p.lineCalls, p.secretCalls, p.confirmCalls)
 	}
 
@@ -229,7 +252,7 @@ func TestConnectionStdinModeDoesNotEnterWizardOnTTY(t *testing.T) {
 	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "必须同时提供") {
 		t.Fatalf("TTY 下 stdin 缺少普通参数应立即失败，错误：%v", err)
 	}
-	if p.lineCalls != 0 || p.secretCalls != 0 || p.confirmCalls != 0 {
+	if p.lineCalls != 0 || p.secretCalls != 0 || p.selectCalls != 0 || p.confirmCalls != 0 {
 		t.Fatalf("不完整 stdin 模式消费了交互输入：line=%d secret=%d confirm=%d", p.lineCalls, p.secretCalls, p.confirmCalls)
 	}
 }
@@ -239,7 +262,7 @@ func TestConnectionWizardCreatesWithoutLeakingSecret(t *testing.T) {
 	if err := os.Chmod(dir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	p := &fakePrompter{terminal: true, lines: []string{"demo", "1", "https://api.example.test", "1", "upstream-model=Display", ""}, secret: "wizard-api-secret", confirm: true}
+	p := &fakePrompter{terminal: true, lines: []string{"demo", "https://api.example.test", "upstream-model=Display", "other-model"}, selections: []string{config.Chat, "direct", "continue", "finish"}, secret: "wizard-api-secret", confirm: true}
 	var output, stderr bytes.Buffer
 	// 用私有命令构造器注入向导输入，避免扩大公开 Options。
 	cmd := newConnectionCommandWithPrompter(func() (*store.Store, error) { return store.New(dir) }, Options{}, p)
@@ -262,8 +285,32 @@ func TestConnectionWizardCreatesWithoutLeakingSecret(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Secrets[state.Connections["demo"].CredentialRef] != "wizard-api-secret" {
+	created := state.Connections["demo"]
+	if state.Secrets[created.CredentialRef] != "wizard-api-secret" {
 		t.Fatal("向导没有保存连接 key")
+	}
+	if len(created.Models) != 2 || created.Models[0].ID != "upstream-model" || created.Models[0].Name != "Display" || created.Models[1].ID != "other-model" {
+		t.Fatalf("继续录入/完成菜单生成了错误模型清单：%+v", created.Models)
+	}
+	wantMenus := [][]promptOption{
+		{{label: "Chat Completions", value: config.Chat}, {label: "Anthropic Messages", value: config.Anthropic}, {label: "Responses", value: config.Responses}},
+		{{label: "直接录入", value: "direct"}, {label: "YAML 文件", value: "yaml"}},
+		{{label: "完成录入", value: "finish"}, {label: "继续添加模型", value: "continue"}},
+		{{label: "完成录入", value: "finish"}, {label: "继续添加模型", value: "continue"}},
+		{{label: "取消", value: "false"}, {label: "确认", value: "true"}},
+	}
+	if len(p.selectedMenus) != len(wantMenus) {
+		t.Fatalf("菜单次数不符：got %d, want %d", len(p.selectedMenus), len(wantMenus))
+	}
+	for i := range wantMenus {
+		if len(p.selectedMenus[i]) != len(wantMenus[i]) {
+			t.Fatalf("第 %d 个菜单选项数错误：%+v", i+1, p.selectedMenus[i])
+		}
+		for j := range wantMenus[i] {
+			if p.selectedMenus[i][j] != wantMenus[i][j] {
+				t.Fatalf("第 %d 个菜单顺序错误：got %+v, want %+v", i+1, p.selectedMenus[i], wantMenus[i])
+			}
+		}
 	}
 }
 
@@ -272,10 +319,12 @@ func TestConnectionWizardCancellationAndInvalidInputDoNotSave(t *testing.T) {
 		name string
 		p    *fakePrompter
 	}{
-		{name: "取消确认", p: &fakePrompter{terminal: true, lines: []string{"demo", "1", "https://api.example.test", "1", "upstream-model", ""}, secret: "wizard-api-secret", confirm: false}},
+		{name: "取消确认", p: &fakePrompter{terminal: true, lines: []string{"demo", "https://api.example.test", "upstream-model"}, selections: []string{config.Chat, "direct", "finish"}, secret: "wizard-api-secret", confirm: false}},
 		{name: "EOF", p: &fakePrompter{terminal: true, lines: []string{"demo"}}},
 		{name: "控制字符", p: &fakePrompter{terminal: true, lines: []string{"bad\x1fname"}}},
-		{name: "无效 key", p: &fakePrompter{terminal: true, lines: []string{"demo", "1", "https://api.example.test", "1", "upstream-model", ""}, secret: "bad key", confirm: true}},
+		{name: "选择 I/O 错误", p: &fakePrompter{terminal: true, lines: []string{"demo"}, selectErr: errors.New("terminal input failure")}},
+		{name: "取消读取 key", p: &fakePrompter{terminal: true, lines: []string{"demo", "https://api.example.test", "upstream-model"}, selections: []string{config.Chat, "direct", "finish"}, secretErr: context.Canceled}},
+		{name: "无效 key", p: &fakePrompter{terminal: true, lines: []string{"demo", "https://api.example.test", "upstream-model"}, selections: []string{config.Chat, "direct", "finish"}, secret: "bad key", confirm: true}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -307,6 +356,15 @@ func TestConnectionWizardCancellationAndInvalidInputDoNotSave(t *testing.T) {
 				t.Fatalf("失败向导保存了部分状态：%v", state.Connections)
 			}
 		})
+	}
+}
+
+func TestSanitizeCredentialErrorPreservesCancellation(t *testing.T) {
+	if err := sanitizeCredentialError(context.Canceled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("凭证错误脱敏覆盖了取消状态：%v", err)
+	}
+	if err := sanitizeCredentialError(errors.New("read failed")); err == nil || !strings.Contains(err.Error(), "API key 输入无效") {
+		t.Fatalf("普通凭证读取错误未脱敏：%v", err)
 	}
 }
 

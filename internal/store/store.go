@@ -2,14 +2,17 @@ package store
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/shichao-wang/cpagw/internal/config"
-	"golang.org/x/sys/unix"
 	"io"
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
+
+	"github.com/shichao-wang/cpagw/internal/config"
+	"golang.org/x/sys/unix"
 )
 
 type Store struct{ Dir string }
@@ -178,4 +181,74 @@ func (s *Store) Update(fn func(*config.State) error) error {
 		state.Revision++
 		return WriteJSON(s.Path("state.json"), state)
 	})
+}
+
+// UpdateContext 在可取消的锁等待中原子更新状态。
+func (s *Store) UpdateContext(ctx context.Context, fn func(*config.State) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	path := s.Path("state.lock")
+	if err := CheckFile(path); err != nil {
+		return err
+	}
+	fd, err := unix.Open(path, unix.O_CREAT|unix.O_RDWR|unix.O_NOFOLLOW, 0600)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err = unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB)
+		if err == nil {
+			break
+		}
+		if err == unix.EINTR {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			continue
+		}
+		if err != unix.EWOULDBLOCK && err != unix.EAGAIN {
+			return err
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	defer unix.Flock(fd, unix.LOCK_UN)
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	state, err := s.Read()
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := fn(state); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	state.Revision++
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return WriteJSON(s.Path("state.json"), state)
 }

@@ -1,21 +1,31 @@
 package cli
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strings"
 	"unicode"
 
+	tea "charm.land/bubbletea/v2"
+	"charm.land/huh/v2"
 	"golang.org/x/term"
 )
 
 // connectionPrompter 隔离向导输入，测试可注入实现而不扩展公开 Options。
 type connectionPrompter interface {
 	IsTerminal() bool
-	ReadLine(label string) (string, error)
-	ReadSecret(label string) (string, error)
-	Confirm(label string) (bool, error)
+	ReadLine(ctx context.Context, label string) (string, error)
+	ReadSecret(ctx context.Context, label string) (string, error)
+	Select(ctx context.Context, label string, options []promptOption) (string, error)
+	Confirm(ctx context.Context, label string) (bool, error)
+}
+
+type promptOption struct {
+	label string
+	value string
 }
 
 type terminalPrompter struct {
@@ -32,55 +42,74 @@ func (p terminalPrompter) IsTerminal() bool {
 	return ok && term.IsTerminal(int(f.Fd()))
 }
 
-// ReadLine 按字节读取单行，避免 bufio 预读后续隐藏密码输入。
-func (p terminalPrompter) ReadLine(label string) (string, error) {
-	if _, err := fmt.Fprintf(p.out, "%s", label); err != nil {
-		return "", err
+func (p terminalPrompter) ReadLine(ctx context.Context, label string) (string, error) {
+	var value string
+	field := huh.NewInput().Title(label + "（Enter 提交；Ctrl+C 取消）").CharLimit(4096).Value(&value)
+	if err := p.form(field).RunWithContext(ctx); err != nil {
+		return "", promptError(ctx, err)
 	}
-	f, ok := p.in.(*os.File)
-	if !ok {
-		return "", fmt.Errorf("交互输入不可用")
-	}
-	var result []byte
-	for len(result) <= 4096 {
-		var b [1]byte
-		n, err := f.Read(b[:])
-		if err != nil {
-			return "", err
-		}
-		if n == 0 {
-			return "", io.EOF
-		}
-		if b[0] == '\n' {
-			return strings.TrimSuffix(string(result), "\r"), nil
-		}
-		result = append(result, b[0])
-	}
-	return "", fmt.Errorf("输入过长")
+	return value, nil
 }
 
-func (p terminalPrompter) ReadSecret(label string) (string, error) {
-	f, ok := p.in.(*os.File)
-	if !ok || !term.IsTerminal(int(f.Fd())) {
-		return "", fmt.Errorf("隐藏输入不可用")
+func (p terminalPrompter) ReadSecret(ctx context.Context, label string) (string, error) {
+	var value string
+	field := huh.NewInput().Title(label + "（Enter 提交；Ctrl+C 取消）").EchoMode(huh.EchoModeNone).CharLimit(4096).Value(&value)
+	if err := p.form(field).RunWithContext(ctx); err != nil {
+		return "", promptError(ctx, err)
 	}
-	if _, err := fmt.Fprint(p.out, label); err != nil {
-		return "", err
-	}
-	secret, err := term.ReadPassword(int(f.Fd()))
-	_, _ = fmt.Fprintln(p.out)
-	if err != nil {
-		return "", err
-	}
-	return string(secret), nil
+	return value, nil
 }
 
-func (p terminalPrompter) Confirm(label string) (bool, error) {
-	answer, err := p.ReadLine(label + " [y/N] ")
-	if err != nil {
-		return false, err
+func (p terminalPrompter) Select(ctx context.Context, label string, options []promptOption) (string, error) {
+	var value string
+	huhOptions := make([]huh.Option[string], 0, len(options))
+	for _, option := range options {
+		huhOptions = append(huhOptions, huh.NewOption(option.label, option.value))
 	}
-	return strings.EqualFold(strings.TrimSpace(answer), "y") || strings.EqualFold(strings.TrimSpace(answer), "yes"), nil
+	field := huh.NewSelect[string]().Title(label + "（↑/↓选择，Enter 确认；Ctrl+C 取消）").Options(huhOptions...).Value(&value)
+	if err := p.form(field).RunWithContext(ctx); err != nil {
+		return "", promptError(ctx, err)
+	}
+	for _, option := range options {
+		if option.value == value {
+			return value, nil
+		}
+	}
+	return "", fmt.Errorf("请选择列表中的选项")
+}
+
+func (p terminalPrompter) Confirm(ctx context.Context, label string) (bool, error) {
+	value := false
+	field := huh.NewSelect[bool]().Title(label+"（↑/↓选择，Enter 确认；Ctrl+C 取消）").Options(
+		huh.NewOption("取消", false),
+		huh.NewOption("确认", true),
+	).Value(&value)
+	if err := p.form(field).RunWithContext(ctx); err != nil {
+		return false, promptError(ctx, err)
+	}
+	return value, nil
+}
+
+func (p terminalPrompter) form(field huh.Field) *huh.Form {
+	keymap := huh.NewDefaultKeyMap()
+	keymap.Input.Next.SetHelp("Enter", "下一项")
+	keymap.Input.Submit.SetHelp("Enter", "提交")
+	keymap.Select.Next.SetHelp("Enter", "选择")
+	keymap.Select.Submit.SetHelp("Enter", "确认")
+	keymap.Select.Up.SetHelp("↑", "上移")
+	keymap.Select.Down.SetHelp("↓", "下移")
+	// OS 信号统一由主程序的 NotifyContext 管理，表单仅通过 context 取消。
+	return huh.NewForm(huh.NewGroup(field)).WithProgramOptions(tea.WithoutSignalHandler()).WithInput(p.in).WithOutput(p.out).WithAccessible(false).WithKeyMap(keymap)
+}
+
+func promptError(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if errors.Is(err, huh.ErrUserAborted) || errors.Is(err, io.EOF) {
+		return context.Canceled
+	}
+	return err
 }
 
 func validatePromptText(value, field string) (string, error) {

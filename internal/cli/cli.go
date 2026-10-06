@@ -1,7 +1,7 @@
 package cli
 
 import (
-	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -143,19 +143,16 @@ func confirmRemoval(cmd *cobra.Command, yes bool, subject string) error {
 	if yes {
 		return nil
 	}
-	file, ok := cmd.InOrStdin().(*os.File)
-	if !ok || !term.IsTerminal(int(file.Fd())) {
+	p := newTerminalPrompter(cmd.InOrStdin(), cmd.ErrOrStderr())
+	if !p.IsTerminal() {
 		return fmt.Errorf("非交互环境删除操作必须提供 --yes")
 	}
-	if _, err := fmt.Fprintf(cmd.ErrOrStderr(), "确认删除 %s？[y/N] ", subject); err != nil {
-		return fmt.Errorf("无法确认删除")
+	confirmed, err := p.Confirm(cmd.Context(), "确认删除 "+subject+"？")
+	if err != nil {
+		return err
 	}
-	answer, err := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
-	if err != nil && len(answer) == 0 {
-		return fmt.Errorf("已取消删除")
-	}
-	if !strings.EqualFold(strings.TrimSpace(answer), "y") && !strings.EqualFold(strings.TrimSpace(answer), "yes") {
-		return fmt.Errorf("已取消删除")
+	if !confirmed {
+		return context.Canceled
 	}
 	return nil
 }

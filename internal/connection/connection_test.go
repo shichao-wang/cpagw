@@ -2,6 +2,7 @@ package connection
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -33,9 +34,25 @@ func TestParseModelsStrictAndUnique(t *testing.T) {
 	}
 }
 
+func TestCreateCancelledContextDoesNotSave(t *testing.T) {
+	st := testStore(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := Create(ctx, st, testConnection("default", "https://api.example.test"), "secret"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("已取消创建应返回 context.Canceled，实际为 %v", err)
+	}
+	state, err := st.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Revision != 0 || len(state.Connections) != 0 || len(state.Secrets) != 0 {
+		t.Fatalf("已取消创建改变状态：revision=%d connections=%v secrets=%v", state.Revision, state.Connections, state.Secrets)
+	}
+}
+
 func TestCreateKeyRotationAndSharedCredentialGC(t *testing.T) {
 	st := testStore(t)
-	if err := Create(st, testConnection("default", "https://api.example.test"), "first-secret"); err != nil {
+	if err := Create(context.Background(), st, testConnection("default", "https://api.example.test"), "first-secret"); err != nil {
 		t.Fatal(err)
 	}
 	before, err := st.Read()
@@ -49,7 +66,7 @@ func TestCreateKeyRotationAndSharedCredentialGC(t *testing.T) {
 	if first.CredentialRef == "" {
 		t.Fatal("连接缺少独立 credentialRef")
 	}
-	if err := Create(st, testConnection("default", "https://other.example.test"), "duplicate-secret"); err == nil {
+	if err := Create(context.Background(), st, testConnection("default", "https://other.example.test"), "duplicate-secret"); err == nil {
 		t.Fatal("全局重名连接应拒绝")
 	}
 	if err := st.Update(func(s *config.State) error {
@@ -89,7 +106,7 @@ func TestCreateKeyRotationAndSharedCredentialGC(t *testing.T) {
 
 func TestPatchIsAtomicAndGuardsReferencedModels(t *testing.T) {
 	st := testStore(t)
-	if err := Create(st, testConnection("c", "https://api.example.test"), "secret"); err != nil {
+	if err := Create(context.Background(), st, testConnection("c", "https://api.example.test"), "secret"); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.Update(func(s *config.State) error {

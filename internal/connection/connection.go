@@ -73,14 +73,20 @@ func ValidateConnection(c config.Connection) error {
 }
 
 // Create 新建全局唯一连接，并为其保存独立凭证。
-func Create(st *store.Store, c config.Connection, apiKey string) error {
+func Create(ctx context.Context, st *store.Store, c config.Connection, apiKey string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := ValidateConnection(c); err != nil {
 		return err
 	}
 	if err := config.ValidateKey(apiKey); err != nil {
 		return err
 	}
-	return st.Update(func(s *config.State) error {
+	return st.UpdateContext(ctx, func(s *config.State) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if _, ok := s.Connections[c.Name]; ok {
 			return fmt.Errorf("连接已存在：%s", c.Name)
 		}

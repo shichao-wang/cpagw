@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -42,7 +44,7 @@ func newConnectionCommandWithPrompter(open storeFactory, opts Options, prompter 
 			}
 			var err error
 			if name == "" {
-				name, err = promptLine(p, "连接名称：", "连接名称")
+				name, err = promptLine(cmd.Context(), p, "连接名称：", "连接名称")
 				if err != nil {
 					return err
 				}
@@ -63,19 +65,19 @@ func newConnectionCommandWithPrompter(open storeFactory, opts Options, prompter 
 			}
 			if !apiKeyStdin && p.IsTerminal() {
 				if protocol == "" {
-					protocol, err = promptProtocol(p)
+					protocol, err = promptProtocol(cmd.Context(), p)
 					if err != nil {
 						return err
 					}
 				}
 				if baseURL == "" {
-					baseURL, err = promptLine(p, "API 根地址：", "API 根地址")
+					baseURL, err = promptLine(cmd.Context(), p, "API 根地址：", "API 根地址")
 					if err != nil {
 						return err
 					}
 				}
 				if modelsPath == "" {
-					models, path, err := promptModels(p)
+					models, path, err := promptModels(cmd.Context(), p)
 					if err != nil {
 						return err
 					}
@@ -101,7 +103,7 @@ func newConnectionCommandWithPrompter(open storeFactory, opts Options, prompter 
 			if apiKeyStdin {
 				key, err = apiKey(cmd, true)
 			} else {
-				key, err = p.ReadSecret("API key（隐藏输入）：")
+				key, err = p.ReadSecret(cmd.Context(), "API key")
 				if err == nil {
 					key = strings.TrimSpace(key)
 					if err = config.ValidateKey(key); err != nil {
@@ -116,15 +118,18 @@ func newConnectionCommandWithPrompter(open storeFactory, opts Options, prompter 
 				if _, err := fmt.Fprintf(cmd.OutOrStdout(), "\n连接摘要\n名称：%s\n协议：%s\nAPI 根地址：%s\n模型数：%d\n", c.Name, c.Protocol, c.BaseURL, len(c.Models)); err != nil {
 					return err
 				}
-				confirmed, err := p.Confirm("确认保存此连接？")
+				confirmed, err := p.Confirm(cmd.Context(), "确认保存此连接？")
 				if err != nil {
-					return fmt.Errorf("向导已取消")
+					return err
 				}
 				if !confirmed {
-					return fmt.Errorf("向导已取消")
+					return context.Canceled
 				}
 			}
-			if err = connection.Create(st, c, key); err != nil {
+			if err = cmd.Context().Err(); err != nil {
+				return err
+			}
+			if err = connection.Create(cmd.Context(), st, c, key); err != nil {
 				return err
 			}
 			if err = notifyChanged(cmd, opts); err != nil {
@@ -311,71 +316,80 @@ func readConnectionModels(path string) ([]config.Model, error) {
 	return connection.ParseModels(f)
 }
 
-func promptLine(p connectionPrompter, label, field string) (string, error) {
-	value, err := p.ReadLine(label)
+func promptLine(ctx context.Context, p connectionPrompter, label, field string) (string, error) {
+	value, err := p.ReadLine(ctx, label)
 	if err != nil {
-		return "", fmt.Errorf("向导已取消")
+		return "", err
 	}
 	return validatePromptText(value, field)
 }
 
-func promptProtocol(p connectionPrompter) (string, error) {
-	value, err := p.ReadLine("协议（1 chat-completions / 2 anthropic-messages / 3 responses）：")
-	if err != nil {
-		return "", fmt.Errorf("向导已取消")
-	}
-	protocols := map[string]string{"1": config.Chat, "2": config.Anthropic, "3": config.Responses, config.Chat: config.Chat, config.Anthropic: config.Anthropic, config.Responses: config.Responses}
-	protocol, ok := protocols[strings.TrimSpace(value)]
-	if !ok {
-		return "", fmt.Errorf("协议必须明确选择 chat-completions、anthropic-messages 或 responses")
-	}
-	return protocol, nil
+func promptProtocol(ctx context.Context, p connectionPrompter) (string, error) {
+	return p.Select(ctx, "选择上游协议", []promptOption{
+		{label: "Chat Completions", value: config.Chat},
+		{label: "Anthropic Messages", value: config.Anthropic},
+		{label: "Responses", value: config.Responses},
+	})
 }
 
-func promptModels(p connectionPrompter) ([]config.Model, string, error) {
-	choice, err := p.ReadLine("模型来源（1 直接录入 / 2 YAML 文件）：")
+func promptModels(ctx context.Context, p connectionPrompter) ([]config.Model, string, error) {
+	choice, err := p.Select(ctx, "选择模型来源", []promptOption{
+		{label: "直接录入", value: "direct"},
+		{label: "YAML 文件", value: "yaml"},
+	})
 	if err != nil {
-		return nil, "", fmt.Errorf("向导已取消")
+		return nil, "", err
 	}
-	switch strings.TrimSpace(choice) {
-	case "1":
+	switch choice {
+	case "direct":
 		models := make([]config.Model, 0, 4)
 		for len(models) < 100 {
-			line, err := p.ReadLine("模型 ID[=展示名]（空行结束）：")
-			if err != nil {
-				return nil, "", fmt.Errorf("向导已取消")
-			}
-			line = strings.TrimSpace(line)
-			if line == "" {
-				break
-			}
-			clean, err := validatePromptText(line, "模型")
+			line, err := promptLine(ctx, p, "模型录入：模型 ID[=展示名]", "模型")
 			if err != nil {
 				return nil, "", err
 			}
 			model := config.Model{}
-			id, display, hasDisplay := strings.Cut(clean, "=")
+			id, display, hasDisplay := strings.Cut(line, "=")
 			model.ID = strings.TrimSpace(id)
 			if hasDisplay {
 				model.Name = strings.TrimSpace(display)
 			}
 			models = append(models, model)
+			if len(models) == 100 {
+				break
+			}
+			next, err := p.Select(ctx, "模型录入", []promptOption{
+				{label: "完成录入", value: "finish"},
+				{label: "继续添加模型", value: "continue"},
+			})
+			if err != nil {
+				return nil, "", err
+			}
+			if next == "finish" {
+				break
+			}
+			if next != "continue" {
+				return nil, "", fmt.Errorf("请选择列表中的模型录入操作")
+			}
 		}
 		if err := config.ValidateModels(models); err != nil {
 			return nil, "", err
 		}
 		return models, "", nil
-	case "2":
-		path, err := promptLine(p, "模型 YAML 文件路径：", "模型 YAML 文件路径")
+	case "yaml":
+		path, err := promptLine(ctx, p, "模型 YAML 文件路径：", "模型 YAML 文件路径")
 		return nil, path, err
 	default:
-		return nil, "", fmt.Errorf("请选择直接录入或 YAML 文件")
+		return nil, "", fmt.Errorf("请选择列表中的模型来源")
 	}
 }
 
 func sanitizeCredentialError(err error) error {
 	if err == nil {
 		return nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
 	}
 	return fmt.Errorf("API key 输入无效或读取失败")
 }
