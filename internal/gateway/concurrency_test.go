@@ -37,10 +37,9 @@ func TestConcurrentProfilesWithSamePublicID(t *testing.T) {
 	state := testState(address, a.URL, b.URL, a.URL, a.URL)
 	for name, p := range state.Profiles {
 		for slot, binding := range p.Models {
-			binding.Provider = "chat-provider"
-			binding.Connection = "connection-a"
+			binding.Connection = "chat-a"
 			if name == "beta" {
-				binding.Connection = "connection-b"
+				binding.Connection = "chat-b"
 			}
 			binding.TargetModel = "shared-target"
 			p.Models[slot] = binding

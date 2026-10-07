@@ -6,11 +6,13 @@
 
 ## 领域边界
 
-- `provider` 表示服务提供商配置实例；不引入独立 vendor 字段。
-- `connection` 表示明确的上游协议、地址、凭证覆盖和模型清单。
-- `profile` 表示下游 Agent 的专属 key、公开模型 ID 与连接/上游模型绑定。
-- 提供商默认 key 仅被没有连接级覆盖的连接继承。不要从提供商名称推断协议能力。
+- `connection` 是独立上游连接，保存稳定 ID、明确的协议/认证方式、地址、自己的凭证引用和模型清单；名称在状态内唯一。
+- `profile` 表示下游 Agent 的专属 key、公开模型 ID 与 connection/上游模型绑定。
+- 不引入 provider、vendor 或默认凭证继承；不要从连接名称推断协议能力。
 - cpagw 状态是唯一事实源，SDK 配置是私有派生数据。
+- 仅支持 schema 3，不保留 provider、旧绑定或 schema 1/2 的兼容与迁移；遇到旧状态拒绝读取和覆盖，使用新状态目录重新配置。
+- Codex OAuth 仅允许 responses 协议及官方 Codex endpoint，不回退 API key。结构状态与 OAuth 凭证分离，刷新以连接 ID/ref/generation 条件保存，不增加结构 revision；失败须撤销目标 SDK 认证并停止在途输出。
+- OAuth 创建、登录/退出、认证切换及删除要求网关停止；网络登录只持运行锁，不持状态锁。静态热更新不能重新加载 OAuth 或复活失效凭证。
 
 ## 实现约束
 

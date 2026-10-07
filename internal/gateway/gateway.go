@@ -247,17 +247,17 @@ func compile(state *config.State, st *store.Store) (*snapshot, error) {
 	usedKeys := map[[32]byte]string{}
 	connections := map[string]connectionInfo{}
 	var connectionKeys []string
-	for pname, provider := range state.Providers {
-		for cname, connection := range provider.Connections {
-			info := connectionInfo{provider: pname, name: cname, id: connection.ID, authType: connection.AuthType,
-				credentialRef: connection.CredentialRef, prefix: config.ConnectionPrefix(pname, cname),
+	for cname, connection := range state.Connections {
+		{
+			info := connectionInfo{name: cname, id: connection.ID, authType: connection.AuthType,
+				credentialRef: connection.CredentialRef, prefix: config.ConnectionPrefix(cname),
 				protocol: connection.Protocol, baseURL: connection.BaseURL, models: connection.Models}
 			switch connection.AuthType {
 			case config.AuthAPIKey:
-				info.apiKey, err = state.Key(pname, connection)
+				info.apiKey, err = state.Key(connection)
 				if err != nil {
 					// 未被 profile 使用的待配置连接不进入 SDK，也不影响其他连接。
-					if len(state.References(pname, cname, "")) == 0 {
+					if len(state.References(cname, "")) == 0 {
 						continue
 					}
 					return nil, err
@@ -266,7 +266,7 @@ func compile(state *config.State, st *store.Store) (*snapshot, error) {
 			default:
 				return nil, fmt.Errorf("连接必须显式声明有效的认证方式")
 			}
-			key := pname + "\x00" + cname
+			key := cname
 			connections[key] = info
 			connectionKeys = append(connectionKeys, key)
 		}
@@ -304,7 +304,7 @@ func compile(state *config.State, st *store.Store) (*snapshot, error) {
 		ps := profileSnapshot{name: name, id: profile.ID, models: make(map[string]modelRoute, len(profile.Models))}
 		for _, slot := range config.Slots {
 			binding := profile.Models[slot]
-			info := connections[binding.Provider+"\x00"+binding.Connection]
+			info := connections[binding.Connection]
 			route := modelRoute{
 				publicID: binding.PublicModel, targetModel: binding.TargetModel,
 				sdkModel: info.prefix + "/" + binding.TargetModel, prefix: info.prefix,
@@ -320,7 +320,6 @@ func compile(state *config.State, st *store.Store) (*snapshot, error) {
 }
 
 type connectionInfo struct {
-	provider      string
 	name          string
 	prefix        string
 	protocol      string
@@ -334,10 +333,10 @@ type connectionInfo struct {
 
 func appendSDKConnection(cfg *sdkconfig.Config, info connectionInfo, models []config.Model) error {
 	if strings.TrimSpace(info.baseURL) == "" {
-		return fmt.Errorf("连接 %s/%s 缺少 API 根地址", info.provider, info.name)
+		return fmt.Errorf("连接 %s 缺少 API 根地址", info.name)
 	}
 	if err := config.ValidateURL(info.baseURL); err != nil {
-		return fmt.Errorf("连接 %s/%s 地址无效：%w", info.provider, info.name, err)
+		return fmt.Errorf("连接 %s 地址无效：%w", info.name, err)
 	}
 	switch info.protocol {
 	case config.Anthropic:
@@ -363,7 +362,7 @@ func appendSDKConnection(cfg *sdkconfig.Config, info connectionInfo, models []co
 		}
 		cfg.OpenAICompatibility = append(cfg.OpenAICompatibility, entry)
 	default:
-		return fmt.Errorf("连接 %s/%s 的上游协议不受支持：%s", info.provider, info.name, info.protocol)
+		return fmt.Errorf("连接 %s 的上游协议不受支持：%s", info.name, info.protocol)
 	}
 	return nil
 }

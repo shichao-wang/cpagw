@@ -12,7 +12,7 @@ func TestSaveOAuthCASDoesNotChangeRevision(t *testing.T) {
 	cred := config.OAuthCredential{AccessToken: "access-1", RefreshToken: "refresh-1", AccountID: "account", ExpiresAt: time.Now().Add(time.Hour), Generation: 1}
 	if err := s.Update(func(st *config.State) error {
 		st.OAuthCredentials["oauth-ref"] = cred
-		st.Providers["p"] = config.Provider{Name: "p", Connections: map[string]config.Connection{"c": {ID: "connection-id", Name: "c", AuthType: config.AuthCodexOAuth, Protocol: config.Responses, BaseURL: config.CodexBaseURL, CredentialRef: "oauth-ref", Models: []config.Model{{ID: "m"}}}}}
+		st.Connections["c"] = config.Connection{ID: "connection-id", Name: "c", AuthType: config.AuthCodexOAuth, Protocol: config.Responses, BaseURL: config.CodexBaseURL, CredentialRef: "oauth-ref", Models: []config.Model{{ID: "m"}}}
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -21,7 +21,7 @@ func TestSaveOAuthCASDoesNotChangeRevision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	binding := OAuthBinding{Provider: "p", Connection: "c", ConnectionID: "connection-id", CredentialRef: "oauth-ref", Generation: 1}
+	binding := OAuthBinding{Connection: "c", ConnectionID: "connection-id", CredentialRef: "oauth-ref", Generation: 1}
 	cred.AccessToken = "access-2"
 	cred.RefreshToken = "refresh-2"
 	generation, err := s.SaveOAuth(binding, cred)

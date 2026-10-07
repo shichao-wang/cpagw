@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,7 +17,7 @@ import (
 	cliproxy "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/shichao-wang/cpagw/internal/config"
-	"github.com/shichao-wang/cpagw/internal/provider"
+	"github.com/shichao-wang/cpagw/internal/connection"
 	"github.com/shichao-wang/cpagw/internal/store"
 )
 
@@ -48,30 +49,52 @@ func oauthTestState(t *testing.T) (*store.Store, *config.State) {
 	}
 	state := config.NewState()
 	state.Listen = listen
-	p := config.Provider{Name: "mixed", Connections: map[string]config.Connection{}, DefaultCredentialRef: "default-key"}
-	state.Secrets["default-key"] = "api-key-test"
 	for _, name := range []string{"a", "b", "api", "unlogged"} {
 		c := config.Connection{ID: "connection-" + name, Name: name, AuthType: config.AuthCodexOAuth, Protocol: config.Responses, BaseURL: config.CodexBaseURL, Models: []config.Model{{ID: "gpt-5.5"}, {ID: "unavailable-model"}}}
 		if name == "api" {
 			c.AuthType = config.AuthAPIKey
 			c.BaseURL = "https://mock.example.test"
+			c.CredentialRef = "api-key"
+			state.Secrets[c.CredentialRef] = "api-key-test"
 		} else if name != "unlogged" {
 			c.CredentialRef = "oauth-" + name
 			state.OAuthCredentials[c.CredentialRef] = config.OAuthCredential{AccessToken: "access-" + name, RefreshToken: "refresh-" + name, AccountID: "account-" + name, PlanType: "pro", ExpiresAt: time.Now().Add(7 * 24 * time.Hour), LastRefresh: time.Now(), Generation: 1}
 		}
-		p.Connections[name] = c
+		state.Connections[name] = c
 		profile := config.Profile{Name: name, ID: "profile-" + name, Agent: "claude-code", KeyRef: "client-" + name, Models: map[string]config.Binding{}}
 		state.Secrets[profile.KeyRef] = "client-secret-" + name
 		for _, slot := range config.Slots {
-			profile.Models[slot] = config.Binding{PublicModel: "claude-" + slot + "-test", Provider: "mixed", Connection: name, TargetModel: "gpt-5.5", Label: name + " " + slot, Description: "mock route"}
+			profile.Models[slot] = config.Binding{PublicModel: "claude-" + slot + "-test", Connection: name, TargetModel: "gpt-5.5", Label: name + " " + slot, Description: "mock route"}
 		}
 		state.Profiles[name] = profile
 	}
-	state.Providers["mixed"] = p
 	if err := st.Update(func(current *config.State) error { *current = *state; return nil }); err != nil {
 		t.Fatal(err)
 	}
 	return st, state
+}
+
+func TestLoggedOAuthWithoutProfileIsRegistered(t *testing.T) {
+	st, state := oauthTestState(t)
+	state.Connections["orphan"] = config.Connection{
+		ID: "connection-orphan", Name: "orphan", AuthType: config.AuthCodexOAuth,
+		Protocol: config.Responses, BaseURL: config.CodexBaseURL, CredentialRef: "oauth-orphan",
+		Models: []config.Model{{ID: "gpt-5.5"}},
+	}
+	state.OAuthCredentials["oauth-orphan"] = config.OAuthCredential{
+		AccessToken: "access-orphan", RefreshToken: "refresh-orphan", AccountID: "account-orphan",
+		PlanType: "pro", ExpiresAt: time.Now().Add(7 * 24 * time.Hour), LastRefresh: time.Now(), Generation: 1,
+	}
+	if err := st.Update(func(current *config.State) error { *current = *state; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	manager := startManagedTest(t, st, runtimeOptions{transport: &oauthTransport{requests: make(chan observedOAuthRequest, 1)}})
+	for _, auth := range manager.List() {
+		if auth.Metadata["account_id"] == "account-orphan" {
+			return
+		}
+	}
+	t.Fatal("没有被 profile 引用的已登录 OAuth 连接未注册")
 }
 
 func startManagedTest(t *testing.T, st *store.Store, options runtimeOptions) *coreauth.Manager {
@@ -99,7 +122,13 @@ func startManagedTest(t *testing.T, st *store.Store, options runtimeOptions) *co
 	options.onManager = func(manager *coreauth.Manager) { managers <- manager }
 	done := make(chan error, 1)
 	go func() {
-		done <- runManagedService(ctx, st, state.Listen, runtimeState.ProbeToken, &active, compiled, &runtimeState, &mu, options)
+		err := runManagedService(ctx, st, state.Listen, runtimeState.ProbeToken, &active, compiled, &runtimeState, &mu, options)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			runtimeState.Ready = false
+			runtimeState.Error = err.Error()
+			_ = writeRuntime(st, runtimeState)
+		}
+		done <- err
 	}()
 	t.Cleanup(func() {
 		cancel()
@@ -186,16 +215,16 @@ func TestOAuthAndAPIKeySameModelIsolationAndHotReload(t *testing.T) {
 	}
 	for _, operation := range []func() error{
 		func() error {
-			session, err := provider.BeginOAuth(st, "mixed", "a")
+			session, err := connection.BeginOAuth(st, "a")
 			if session != nil {
 				session.Close()
 			}
 			return err
 		},
-		func() error { return provider.LogoutOAuth(st, "mixed", "a") },
+		func() error { return connection.LogoutOAuth(st, "a") },
 		func() error {
 			auth := config.AuthAPIKey
-			return provider.PatchConnectionWithAuth(st, "mixed", "a", nil, nil, nil, true, &auth)
+			return connection.Patch(st, "a", nil, nil, nil, &auth)
 		},
 	} {
 		if operation() == nil {
@@ -229,7 +258,7 @@ func TestOAuthAndAPIKeySameModelIsolationAndHotReload(t *testing.T) {
 		if afterRefresh.Revision != beforeRefresh.Revision || afterRefresh.OAuthCredentials["oauth-a"].Generation != uint64(i+2) {
 			t.Fatal("令牌轮换改变了结构 revision 或未推进凭证版本")
 		}
-		if err := st.Update(func(s *config.State) error { s.Secrets["default-key"] = fmt.Sprintf("rotated-key-%d", i); return nil }); err != nil {
+		if err := st.Update(func(s *config.State) error { s.Secrets["api-key"] = fmt.Sprintf("rotated-key-%d", i); return nil }); err != nil {
 			t.Fatal(err)
 		}
 		waitRevision(t, st)

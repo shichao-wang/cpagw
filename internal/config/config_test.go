@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestURLs(t *testing.T) {
 	for _, raw := range []string{"https://api.deepseek.com", "https://api.deepseek.com/anthropic", "http://127.0.0.1:1234", "http://[::1]:8080"} {
@@ -14,49 +17,43 @@ func TestURLs(t *testing.T) {
 		}
 	}
 }
-func TestCredentialInheritance(t *testing.T) {
+
+func TestKeyRequiresConnectionCredential(t *testing.T) {
 	s := NewState()
-	s.Secrets["default"] = "a"
-	s.Secrets["override"] = "b"
-	s.Providers["deepseek"] = Provider{Name: "deepseek", DefaultCredentialRef: "default"}
-	c := Connection{Name: "chat", AuthType: AuthAPIKey, ID: "conn-test"}
-	if got, err := s.Key("deepseek", c); err != nil || got != "a" {
-		t.Fatalf("默认继承失败：%s %v", got, err)
+	s.Secrets["secret"] = "valid-key"
+	s.Secrets[""] = "must-not-be-used"
+	c := Connection{ID: "id", Name: "model", AuthType: AuthAPIKey, CredentialRef: "secret"}
+	if got, err := s.Key(c); err != nil || got != "valid-key" {
+		t.Fatalf("连接 key 解析失败：%s %v", got, err)
 	}
-	c.CredentialRef = "override"
-	if got, err := s.Key("deepseek", c); err != nil || got != "b" {
-		t.Fatalf("覆盖失败：%s %v", got, err)
-	}
-	s.Secrets["default"] = "rotated"
-	if got, _ := s.Key("deepseek", c); got != "b" {
-		t.Fatal("默认轮换覆盖了独立 key")
-	}
-	c.CredentialRef = "missing"
-	if _, err := s.Key("deepseek", c); err == nil {
-		t.Fatal("缺失的覆盖 key 不应回退到默认")
+	for _, ref := range []string{"missing", "", " \t"} {
+		c.CredentialRef = ref
+		if _, err := s.Key(c); err == nil {
+			t.Fatalf("凭证引用 %q 不应回退", ref)
+		}
 	}
 }
-func TestOAuthAuthIsExplicitAndDoesNotInheritProviderKey(t *testing.T) {
+
+func TestOAuthAuthIsExplicitAndAllowsUnloggedProfileStructure(t *testing.T) {
 	s := NewState()
-	s.Secrets["default"] = "provider-key"
-	s.Providers["p"] = Provider{Name: "p", DefaultCredentialRef: "default", Connections: map[string]Connection{}}
+	s.Secrets["secret"] = "provider-key"
 	c := Connection{ID: "oauth-id", Name: "oauth", AuthType: AuthCodexOAuth, Protocol: Responses, BaseURL: CodexBaseURL, Models: []Model{{ID: "m"}}}
-	s.Providers["p"].Connections["oauth"] = c
-	if _, err := s.Key("p", c); err == nil {
-		t.Fatal("OAuth 不得被解释为 API key 或继承默认 key")
+	s.Connections[c.Name] = c
+	if _, err := s.Key(c); err == nil {
+		t.Fatal("OAuth 不得被解释为 API key")
 	}
 	if err := s.Validate(); err != nil {
 		t.Fatalf("未登录 OAuth 连接应是合法状态：%v", err)
 	}
-	profile := Profile{Agent: "claude-code", Models: map[string]Binding{}}
+	p := Profile{Agent: "claude-code", Models: map[string]Binding{}}
 	for _, slot := range Slots {
-		profile.Models[slot] = Binding{PublicModel: "claude-" + slot + "-test", Provider: "p", Connection: "oauth", TargetModel: "m"}
+		p.Models[slot] = Binding{PublicModel: "claude-" + slot + "-test", Connection: "oauth", TargetModel: "m"}
 	}
-	if err := s.ValidateProfileStructure(profile); err != nil {
+	if err := s.ValidateProfileStructure(p); err != nil {
 		t.Fatalf("合法但未登录的 OAuth profile 结构应通过：%v", err)
 	}
-	if err := s.ValidateProfile(profile); err == nil {
-		t.Fatal("profile 写入校验必须要求 OAuth 已登录")
+	if err := s.ValidateProfile(p); err == nil {
+		t.Fatal("认证就绪校验必须要求 OAuth 已登录")
 	}
 	c.AuthType = ""
 	if ValidateAuthConnection(c) == nil {
@@ -71,11 +68,11 @@ func TestOAuthAuthIsExplicitAndDoesNotInheritProviderKey(t *testing.T) {
 
 func TestProfileValidation(t *testing.T) {
 	s := NewState()
-	s.Secrets["k"] = "key"
-	s.Providers["p"] = Provider{Name: "p", DefaultCredentialRef: "k", Connections: map[string]Connection{"c": {ID: "conn-test", Name: "c", AuthType: AuthAPIKey, Protocol: Anthropic, Models: []Model{{ID: "upstream"}}}}}
+	s.Secrets["k"] = "valid-key"
+	s.Connections["c"] = Connection{ID: "connection-id", Name: "c", AuthType: AuthAPIKey, Protocol: Anthropic, BaseURL: "https://api.example.test", CredentialRef: "k", Models: []Model{{ID: "upstream"}}}
 	p := Profile{Agent: "claude-code", Models: map[string]Binding{}}
 	for _, slot := range Slots {
-		p.Models[slot] = Binding{PublicModel: "claude-" + slot + "-test", Provider: "p", Connection: "c", TargetModel: "upstream"}
+		p.Models[slot] = Binding{PublicModel: "claude-" + slot + "-test", Connection: "c", TargetModel: "upstream"}
 	}
 	if err := s.ValidateProfile(p); err != nil {
 		t.Fatal(err)
@@ -85,5 +82,61 @@ func TestProfileValidation(t *testing.T) {
 	p.Models["sonnet"] = b
 	if s.ValidateProfile(p) == nil {
 		t.Fatal("重复公开 ID 不应通过")
+	}
+}
+
+func TestModelAndBindingTextRejectControlCharacters(t *testing.T) {
+	for _, models := range [][]Model{
+		{{ID: "model\nsecret"}},
+		{{ID: "model", Name: "line\tbreak"}},
+	} {
+		if ValidateModels(models) == nil {
+			t.Fatalf("应拒绝包含控制字符的模型清单：%q", models)
+		}
+	}
+	s := NewState()
+	s.Secrets["k"] = "valid-key"
+	s.Connections["c"] = Connection{ID: "id", Name: "c", AuthType: AuthAPIKey, Protocol: Chat, BaseURL: "https://api.example.test", CredentialRef: "k", Models: []Model{{ID: "upstream"}}}
+	p := Profile{Agent: "claude-code", Models: map[string]Binding{}}
+	for _, slot := range Slots {
+		p.Models[slot] = Binding{PublicModel: "claude-" + slot, Connection: "c", TargetModel: "upstream"}
+	}
+	b := p.Models["opus"]
+	b.Label = "bad\nlabel"
+	p.Models["opus"] = b
+	if s.ValidateProfile(p) == nil {
+		t.Fatal("应拒绝包含控制字符的展示文本")
+	}
+}
+
+func TestUnreferencedAPIConnectionMayLackKeyButProfileFailsClosed(t *testing.T) {
+	s := NewState()
+	s.Connections["idle"] = Connection{ID: "idle-id", Name: "idle", AuthType: AuthAPIKey, Protocol: Chat, BaseURL: "https://api.example.test", Models: []Model{{ID: "m"}}}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("未被引用且缺少 API key 的连接可保留：%v", err)
+	}
+	p := Profile{Name: "demo", ID: "profile-id", Agent: "claude-code", KeyRef: "profile-key", Models: map[string]Binding{}}
+	s.Secrets[p.KeyRef] = "valid-profile-key"
+	for _, slot := range Slots {
+		p.Models[slot] = Binding{PublicModel: "claude-" + slot, Connection: "idle", TargetModel: "m"}
+	}
+	s.Profiles[p.Name] = p
+	if err := s.Validate(); err == nil {
+		t.Fatal("被 profile 引用的 API key 连接缺少凭证时必须 fail-closed")
+	}
+}
+
+func TestValidateRejectsDuplicateConnectionIDsAndUnboundOAuth(t *testing.T) {
+	s := NewState()
+	s.Secrets["key"] = "valid-key"
+	s.Connections["one"] = Connection{ID: "same", Name: "one", AuthType: AuthAPIKey, Protocol: Chat, BaseURL: "https://api.example.test", CredentialRef: "key", Models: []Model{{ID: "m"}}}
+	s.Connections["two"] = Connection{ID: "same", Name: "two", AuthType: AuthAPIKey, Protocol: Chat, BaseURL: "https://api.example.test", CredentialRef: "key", Models: []Model{{ID: "m"}}}
+	if err := s.Validate(); err == nil {
+		t.Fatal("连接 ID 必须唯一")
+	}
+	delete(s.Connections, "two")
+	s.OAuthCredentials["orphan"] = OAuthCredential{AccessToken: "a", RefreshToken: "r", AccountID: "account", ExpiresAt: time.Now().Add(time.Hour), Generation: 1}
+	if err := s.Validate(); err == nil {
+		t.Fatal("未绑定 OAuth 凭证必须拒绝")
 	}
 }

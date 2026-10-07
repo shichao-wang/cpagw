@@ -76,22 +76,25 @@ func Create(st *store.Store, file File) (string, error) {
 		if _, ok := s.Profiles[name]; ok {
 			return fmt.Errorf("profile 已存在：%s", name)
 		}
-		if err := s.ValidateProfile(p); err != nil {
+		if err := s.ValidateProfileStructure(p); err != nil {
 			return err
 		}
 		for slot, binding := range p.Models {
 			if strings.TrimSpace(binding.Label) == "" {
 				binding.Label = binding.TargetModel
-				for _, model := range s.Providers[binding.Provider].Connections[binding.Connection].Models {
+				for _, model := range s.Connections[binding.Connection].Models {
 					if model.ID == binding.TargetModel && model.Name != "" {
 						binding.Label = model.Name
 					}
 				}
 			}
 			if strings.TrimSpace(binding.Description) == "" {
-				binding.Description = fmt.Sprintf("%s / %s / %s", binding.Provider, binding.Connection, binding.TargetModel)
+				binding.Description = fmt.Sprintf("%s / %s", binding.Connection, binding.TargetModel)
 			}
 			p.Models[slot] = binding
+		}
+		if err := s.ValidateProfileStructure(p); err != nil {
+			return err
 		}
 		s.Profiles[name] = p
 		s.Secrets[keyRef] = key
@@ -126,7 +129,7 @@ func Update(st *store.Store, name string, file File) error {
 				p.Models[slot] = binding
 			}
 		}
-		if err := s.ValidateProfile(p); err != nil {
+		if err := s.ValidateProfileStructure(p); err != nil {
 			return err
 		}
 		s.Profiles[name] = p
@@ -134,7 +137,7 @@ func Update(st *store.Store, name string, file File) error {
 	})
 }
 
-// Remove 删除 profile 和其专属本地 key。引用检查由 agent 管理器回调提供。
+// Remove 删除 profile，并仅在本地 key 不再被引用时回收对应凭证。
 func Remove(st *store.Store, name string, isReferenced func(string) (bool, error)) error {
 	if err := config.ValidateName(name); err != nil {
 		return err
@@ -155,7 +158,7 @@ func Remove(st *store.Store, name string, isReferenced func(string) (bool, error
 			return fmt.Errorf("profile 仍被 agent 配置引用：%s", name)
 		}
 		delete(s.Profiles, name)
-		delete(s.Secrets, p.KeyRef)
+		deleteIfUnreferenced(s, p.KeyRef)
 		return nil
 	})
 }
@@ -176,6 +179,23 @@ func validateDraft(p config.Profile) error {
 		seen[binding.PublicModel] = true
 	}
 	return nil
+}
+
+func deleteIfUnreferenced(s *config.State, ref string) {
+	if ref == "" {
+		return
+	}
+	for _, c := range s.Connections {
+		if c.CredentialRef == ref {
+			return
+		}
+	}
+	for _, p := range s.Profiles {
+		if p.KeyRef == ref {
+			return
+		}
+	}
+	delete(s.Secrets, ref)
 }
 
 func randomKey() (string, error) {

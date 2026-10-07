@@ -141,8 +141,8 @@ func (s *SDKStore) List(ctx context.Context) ([]*coreauth.Auth, error) {
 		return nil, err
 	}
 	var records []*coreauth.Auth
-	for providerName, provider := range state.Providers {
-		for connectionName, connection := range provider.Connections {
+	for connectionName, connection := range state.Connections {
+		{
 			if connection.AuthType != config.AuthCodexOAuth || connection.CredentialRef == "" {
 				continue
 			}
@@ -164,14 +164,13 @@ func (s *SDKStore) List(ctx context.Context) ([]*coreauth.Auth, error) {
 				"last_refresh":         credential.LastRefresh.UTC().Format(time.RFC3339Nano),
 				"cpagw_generation":     credential.Generation,
 				"cpagw_connection_id":  connection.ID,
-				"cpagw_provider":       providerName,
 				"cpagw_connection":     connectionName,
 				"cpagw_credential_ref": connection.CredentialRef,
 			}
 			records = append(records, &coreauth.Auth{
 				ID:       authID,
 				Provider: "codex",
-				Prefix:   config.ConnectionPrefix(providerName, connectionName),
+				Prefix:   config.ConnectionPrefix(connectionName),
 				Status:   coreauth.StatusActive,
 				Attributes: map[string]string{
 					"base_url":  config.CodexBaseURL,
@@ -197,22 +196,20 @@ func (s *SDKStore) Save(ctx context.Context, auth *coreauth.Auth) (string, error
 		return s.fail(auth.ID, errors.New("OAuth 凭证绑定信息无效"))
 	}
 	binding := store.OAuthBinding{
-		Provider:      strings.TrimSpace(stringValue(auth.Metadata, "cpagw_provider")),
 		Connection:    strings.TrimSpace(stringValue(auth.Metadata, "cpagw_connection")),
 		ConnectionID:  strings.TrimSpace(stringValue(auth.Metadata, "cpagw_connection_id")),
 		CredentialRef: ref,
 		Generation:    uintValue(auth.Metadata["cpagw_generation"]),
 	}
-	if binding.Provider == "" || binding.Connection == "" || binding.ConnectionID == "" || binding.Generation == 0 {
+	if binding.Connection == "" || binding.ConnectionID == "" || binding.Generation == 0 {
 		return s.fail(auth.ID, errors.New("OAuth 凭证绑定信息无效"))
 	}
 	state, err := s.state.Read()
 	if err != nil {
 		return s.fail(auth.ID, errors.New("读取 OAuth 状态失败"))
 	}
-	provider, providerOK := state.Providers[binding.Provider]
-	connection, connectionOK := provider.Connections[binding.Connection]
-	if !providerOK || !connectionOK || connection.ID != binding.ConnectionID || connection.AuthType != config.AuthCodexOAuth || connection.BaseURL != config.CodexBaseURL || connection.CredentialRef != ref {
+	connection, connectionOK := state.Connections[binding.Connection]
+	if !connectionOK || connection.ID != binding.ConnectionID || connection.AuthType != config.AuthCodexOAuth || connection.BaseURL != config.CodexBaseURL || connection.CredentialRef != ref {
 		return s.fail(auth.ID, errors.New("OAuth 凭证绑定已变化"))
 	}
 	previous, ok := state.OAuthCredentials[ref]

@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,7 +25,9 @@ func idleAPIKeyConnections(prefix string) map[string]config.Connection {
 
 func TestCompileSkipsOnlyUnreferencedAPIKeyConnectionsWithoutCredentials(t *testing.T) {
 	st, state := oauthTestState(t)
-	state.Providers["idle"] = config.Provider{Name: "idle", Connections: idleAPIKeyConnections("initial")}
+	for name, connection := range idleAPIKeyConnections("initial") {
+		state.Connections[name] = connection
+	}
 	compiled, err := compile(state, st)
 	if err != nil {
 		t.Fatalf("闲置连接阻断了有效配置：%v", err)
@@ -32,11 +35,10 @@ func TestCompileSkipsOnlyUnreferencedAPIKeyConnectionsWithoutCredentials(t *test
 	if len(compiled.connections) != 4 || len(staticAuths(compiled, "test")) != 1 || len(compiled.config.CodexKey) != 1 || len(compiled.config.ClaudeKey) != 0 || len(compiled.config.OpenAICompatibility) != 0 {
 		t.Fatal("待配置连接被编译为可选的 SDK 认证或模型配置")
 	}
-	for name := range state.Providers["idle"].Connections {
+	for name := range idleAPIKeyConnections("initial") {
 		t.Run(name, func(t *testing.T) {
 			profile := state.Profiles["a"]
 			for slot, binding := range profile.Models {
-				binding.Provider = "idle"
 				binding.Connection = name
 				profile.Models[slot] = binding
 			}
@@ -51,7 +53,9 @@ func TestCompileSkipsOnlyUnreferencedAPIKeyConnectionsWithoutCredentials(t *test
 func TestIdleAPIKeyConnectionsDoNotInterruptStartupOrHotReload(t *testing.T) {
 	st, state := oauthTestState(t)
 	if err := st.Update(func(s *config.State) error {
-		s.Providers["idle"] = config.Provider{Name: "idle", Connections: idleAPIKeyConnections("initial")}
+		for name, connection := range idleAPIKeyConnections("initial") {
+			s.Connections[name] = connection
+		}
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -76,11 +80,9 @@ func TestIdleAPIKeyConnectionsDoNotInterruptStartupOrHotReload(t *testing.T) {
 	}
 	check(3)
 	if err := st.Update(func(s *config.State) error {
-		p := s.Providers["idle"]
 		for name, connection := range idleAPIKeyConnections("added") {
-			p.Connections[name] = connection
+			s.Connections[name] = connection
 		}
-		s.Providers["idle"] = p
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -88,10 +90,13 @@ func TestIdleAPIKeyConnectionsDoNotInterruptStartupOrHotReload(t *testing.T) {
 	waitRevision(t, st)
 	check(3)
 	if err := st.Update(func(s *config.State) error {
-		p := s.Providers["idle"]
-		p.DefaultCredentialRef = "idle-provider-key"
-		s.Providers["idle"] = p
-		s.Secrets[p.DefaultCredentialRef] = "idle-test-key"
+		for name, connection := range s.Connections {
+			if strings.HasPrefix(name, "initial-") || strings.HasPrefix(name, "added-") {
+				connection.CredentialRef = "idle-key-" + name
+				s.Connections[name] = connection
+				s.Secrets[connection.CredentialRef] = "idle-test-key"
+			}
+		}
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -108,10 +113,13 @@ func TestIdleAPIKeyConnectionsDoNotInterruptStartupOrHotReload(t *testing.T) {
 		t.Fatal("补齐凭证后待配置连接没有热更新为就绪状态")
 	}
 	if err := st.Update(func(s *config.State) error {
-		p := s.Providers["idle"]
-		delete(s.Secrets, p.DefaultCredentialRef)
-		p.DefaultCredentialRef = ""
-		s.Providers["idle"] = p
+		for name, connection := range s.Connections {
+			if strings.HasPrefix(name, "initial-") || strings.HasPrefix(name, "added-") {
+				delete(s.Secrets, connection.CredentialRef)
+				connection.CredentialRef = ""
+				s.Connections[name] = connection
+			}
+		}
 		return nil
 	}); err != nil {
 		t.Fatal(err)

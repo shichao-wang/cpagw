@@ -75,7 +75,7 @@ func profileShowCommand(openStore storeFactory) *cobra.Command {
 				if !ok {
 					continue
 				}
-				if _, err := fmt.Fprintf(cmd.OutOrStdout(), "  %s: %s -> %s/%s/%s", slot, b.PublicModel, b.Provider, b.Connection, b.TargetModel); err != nil {
+				if _, err := fmt.Fprintf(cmd.OutOrStdout(), "  %s: %s -> %s/%s", slot, b.PublicModel, b.Connection, b.TargetModel); err != nil {
 					return err
 				}
 				if b.Label != "" {

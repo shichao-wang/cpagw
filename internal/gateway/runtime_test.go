@@ -8,13 +8,14 @@ import (
 	"testing"
 	"time"
 
+	cliproxy "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/shichao-wang/cpagw/internal/config"
 )
 
 func TestStaticAuthHotReloadReordersIndexesAndRemovesClients(t *testing.T) {
 	st, state := oauthTestState(t)
-	state.Providers = testState(state.Listen, "http://127.0.0.1:9", "http://127.0.0.1:9", "http://127.0.0.1:9", "http://127.0.0.1:9").Providers
+	state.Connections = testState(state.Listen, "http://127.0.0.1:9", "http://127.0.0.1:9", "http://127.0.0.1:9", "http://127.0.0.1:9").Connections
 	state.Profiles = map[string]config.Profile{}
 	for ref, value := range testState(state.Listen, "", "", "", "").Secrets {
 		state.Secrets[ref] = value
@@ -65,16 +66,16 @@ func TestStaticAuthHotReloadReordersIndexesAndRemovesClients(t *testing.T) {
 	check(4)
 	for i := 0; i < 3; i++ {
 		if err := st.Update(func(s *config.State) error {
-			for pname, p := range s.Providers {
-				for cname, c := range p.Connections {
-					c.BaseURL = fmt.Sprintf("http://127.0.0.1:%d", 10000+i)
-					s.Secrets[c.CredentialRef] = fmt.Sprintf("key-revision-%d-%s", i, cname)
-					p.Connections[cname] = c
-				}
-				first := config.Connection{ID: "new-" + pname, Name: "aaa", AuthType: config.AuthAPIKey, Protocol: p.Connections[map[string]string{"chat-provider": "connection-a", "anthropic-provider": "connection", "responses-provider": "connection"}[pname]].Protocol, BaseURL: "http://127.0.0.1:9", CredentialRef: "new-" + pname, Models: []config.Model{{ID: "new-model"}}}
-				p.Connections["aaa"] = first
-				s.Secrets[first.CredentialRef] = "new-key-test"
-				s.Providers[pname] = p
+			for cname, connection := range s.Connections {
+				connection.BaseURL = fmt.Sprintf("http://127.0.0.1:%d", 10000+i)
+				s.Secrets[connection.CredentialRef] = fmt.Sprintf("key-revision-%d-%s", i, cname)
+				s.Connections[cname] = connection
+			}
+			for _, protocol := range []string{config.Chat, config.Anthropic, config.Responses} {
+				name := "aaa-" + protocol
+				connection := config.Connection{ID: fmt.Sprintf("new-%s-%d", protocol, i), Name: name, AuthType: config.AuthAPIKey, Protocol: protocol, BaseURL: "http://127.0.0.1:9", CredentialRef: "new-" + protocol, Models: []config.Model{{ID: "new-model"}}}
+				s.Connections[name] = connection
+				s.Secrets[connection.CredentialRef] = "new-key-test"
 			}
 			return nil
 		}); err != nil {
@@ -84,10 +85,11 @@ func TestStaticAuthHotReloadReordersIndexesAndRemovesClients(t *testing.T) {
 		check(7)
 	}
 	if err := st.Update(func(s *config.State) error {
-		for pname, p := range s.Providers {
-			delete(p.Connections, "aaa")
-			s.Providers[pname] = p
-			delete(s.Secrets, "new-"+pname)
+		for name := range s.Connections {
+			if strings.HasPrefix(name, "aaa-") {
+				delete(s.Secrets, s.Connections[name].CredentialRef)
+				delete(s.Connections, name)
+			}
 		}
 		return nil
 	}); err != nil {
@@ -95,6 +97,41 @@ func TestStaticAuthHotReloadReordersIndexesAndRemovesClients(t *testing.T) {
 	}
 	waitRevision(t, st)
 	check(4)
+}
+
+func TestOAuthTopologyChangeStopsGatewayAndCleansRegistry(t *testing.T) {
+	st, _ := oauthTestState(t)
+	manager := startManagedTest(t, st, runtimeOptions{})
+	var authID string
+	for _, auth := range manager.List() {
+		if auth.Metadata["account_id"] == "account-a" {
+			authID = auth.ID
+			break
+		}
+	}
+	if authID == "" {
+		t.Fatal("OAuth Auth 未注册")
+	}
+	if err := st.Update(func(state *config.State) error {
+		connection := state.Connections["a"]
+		connection.ID = "connection-a-replaced"
+		state.Connections["a"] = connection
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		runtime, err := decodeRuntime(st)
+		if err == nil && !runtime.Ready && strings.Contains(runtime.Error, "OAuth") {
+			if len(cliproxy.GlobalModelRegistry().GetModelsForClient(authID)) != 0 {
+				t.Fatal("OAuth topology 变化停止网关后仍留下模型注册")
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("OAuth topology 变化未停止网关并报告重启")
 }
 
 func TestListenerChangeStopsGatewayAndReportsRestart(t *testing.T) {

@@ -210,7 +210,7 @@ func (g *requestGate) writeCatalog(c *gin.Context, profile profileSnapshot) {
 	if len(data) > 0 {
 		first, last = data[0].ID, data[len(data)-1].ID
 	}
-	c.JSON(http.StatusOK, gin.H{"data": data, "has_more": false, "first_id": first, "last_id": last})
+	c.AbortWithStatusJSON(http.StatusOK, gin.H{"data": data, "has_more": false, "first_id": first, "last_id": last})
 }
 
 func readRootModel(r *http.Request) (string, error) {

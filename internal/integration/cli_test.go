@@ -72,13 +72,13 @@ func TestBinaryFlow(t *testing.T) {
 	if err := os.WriteFile(models, []byte("models:\n  - id: actual\n    name: 实际模型\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	run("upstream-test-key\n", "provider", "add", "alpha", "--api-key-stdin")
-	run("", "provider", "connection", "add", "alpha", "anth", "--protocol", "anthropic-messages", "--base-url", upstream.URL, "--models", models)
+	run("upstream-test-key\n", "connection", "add", "anth", "--protocol", "anthropic-messages", "--base-url", upstream.URL, "--models", models, "--api-key-stdin")
+	// 接入上游仅需添加独立连接，不存在 provider 前置步骤。
 	bindings := filepath.Join(tmp, "bindings.yaml")
 	var yaml strings.Builder
 	yaml.WriteString("models:\n")
 	for _, slot := range []string{"opus", "sonnet", "haiku"} {
-		fmt.Fprintf(&yaml, "  %s:\n    public_model: claude-%s-test\n    provider: alpha\n    connection: anth\n    target_model: actual\n    label: mock-%s\n    description: mock 路由\n", slot, slot, slot)
+		fmt.Fprintf(&yaml, "  %s:\n    public_model: claude-%s-test\n    connection: anth\n    target_model: actual\n    label: mock-%s\n    description: mock 路由\n", slot, slot, slot)
 	}
 	if err := os.WriteFile(bindings, []byte(yaml.String()), 0600); err != nil {
 		t.Fatal(err)
@@ -141,12 +141,22 @@ func TestBinaryFlow(t *testing.T) {
 	if code < 400 || calls.Load() != prior {
 		t.Fatal("未知公开模型不能调用上游")
 	}
-	// 验证轮换提供商默认 key 无需重建 profile 或重新 apply。
+	// 验证轮换连接 key 无需重建 profile 或重新 apply。
 	upstreamKey.Store("rotated-key")
-	run("rotated-key\n", "provider", "update", "alpha", "--api-key-stdin")
+	run("rotated-key\n", "connection", "update", "anth", "--api-key-stdin")
 	code, body = request("POST", "/v1/messages", `{"model":"claude-sonnet-test","max_tokens":20,"messages":[{"role":"user","content":"Hi"}]}`)
 	if code != 200 {
 		t.Fatalf("轮换后路由失败：%d %s", code, body)
+	}
+	replacementModels := filepath.Join(tmp, "replacement-models.yaml")
+	if err := os.WriteFile(replacementModels, []byte("models:\n  - id: replacement\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := invoke("", "connection", "update", "anth", "--models", replacementModels); err == nil {
+		t.Fatalf("仍被 profile 引用的模型不能移除：%s", out)
+	}
+	if out, err := invoke("", "connection", "remove", "anth", "--yes"); err == nil {
+		t.Fatalf("仍被 profile 引用的连接不能删除：%s", out)
 	}
 	settings := filepath.Join(tmp, "settings.json")
 	original := []byte(`{"unrelated":{"keep":true}}`)
@@ -178,5 +188,5 @@ func TestBinaryFlow(t *testing.T) {
 		t.Fatalf("服务未停止：%s", status)
 	}
 	run("", "profile", "delete", "daily", "--yes")
-	run("", "provider", "remove", "alpha", "--yes")
+	run("", "connection", "remove", "anth", "--yes")
 }

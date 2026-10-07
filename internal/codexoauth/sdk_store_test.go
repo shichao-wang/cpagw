@@ -31,16 +31,11 @@ func newTestSDKStore(t *testing.T) (*SDKStore, *store.Store, config.OAuthCredent
 		LastRefresh: time.Now().UTC().Add(-time.Minute), Generation: 1,
 	}
 	state := config.NewState()
-	state.Providers["openai"] = config.Provider{
-		Name: "openai",
-		Connections: map[string]config.Connection{
-			"codex-main": {ID: "connection-id-1", Name: "codex-main", AuthType: config.AuthCodexOAuth,
-				Protocol: config.Responses, BaseURL: config.CodexBaseURL, CredentialRef: "oauth-ref-1",
-				Models: []config.Model{{ID: "gpt-5-codex"}}},
-			"codex-unlogged": {ID: "connection-id-2", Name: "codex-unlogged", AuthType: config.AuthCodexOAuth,
-				Protocol: config.Responses, BaseURL: config.CodexBaseURL, Models: []config.Model{{ID: "gpt-5-codex"}}},
-		},
-	}
+	state.Connections["codex-main"] = config.Connection{ID: "connection-id-1", Name: "codex-main", AuthType: config.AuthCodexOAuth,
+		Protocol: config.Responses, BaseURL: config.CodexBaseURL, CredentialRef: "oauth-ref-1",
+		Models: []config.Model{{ID: "gpt-5-codex"}}}
+	state.Connections["codex-unlogged"] = config.Connection{ID: "connection-id-2", Name: "codex-unlogged", AuthType: config.AuthCodexOAuth,
+		Protocol: config.Responses, BaseURL: config.CodexBaseURL, Models: []config.Model{{ID: "gpt-5-codex"}}}
 	state.OAuthCredentials["oauth-ref-1"] = credential
 	if err := store.WriteJSON(st.Path("state.json"), state); err != nil {
 		t.Fatal(err)
@@ -181,7 +176,7 @@ func TestSDKStoreListLoadsOnlyManagedLoggedOAuth(t *testing.T) {
 		t.Fatalf("List returned %d auth records, want 1", len(got))
 	}
 	auth := got[0]
-	if auth.ID != sdkStore.AuthID("oauth-ref-1") || auth.Provider != "codex" || auth.Prefix != config.ConnectionPrefix("openai", "codex-main") {
+	if auth.ID != sdkStore.AuthID("oauth-ref-1") || auth.Provider != "codex" || auth.Prefix != config.ConnectionPrefix("codex-main") {
 		t.Fatalf("unexpected auth identity: %#v", auth)
 	}
 	if auth.Attributes["base_url"] != config.CodexBaseURL || auth.Attributes["plan_type"] != credential.PlanType {

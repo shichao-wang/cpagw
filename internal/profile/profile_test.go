@@ -14,7 +14,8 @@ func TestParseFileRejectsUnknownFieldsAndExtraDocuments(t *testing.T) {
 		"name: demo\nkeyRef: secret-ref\n",
 		"name: demo\nmodels: {}\nunknown: value\n",
 		"name: demo\n---\nname: second\n",
-		"name: demo\nmodels:\n  sonnet:\n    public_model: claude-test\n    provider: p\n    connection: c\n    target_model: m\n    credentialRef: should-not-be-here\n",
+		"name: demo\nmodels:\n  sonnet:\n    public_model: claude-test\n    provider: p\n    connection: c\n    target_model: m\n",
+		"name: demo\nmodels:\n  sonnet:\n    public_model: claude-test\n    connection: c\n    target_model: m\n    credentialRef: should-not-be-here\n",
 	} {
 		if _, err := ParseFile(strings.NewReader(input)); err == nil {
 			t.Errorf("应拒绝未知字段或多文档 YAML：%q", input)
@@ -24,7 +25,7 @@ func TestParseFileRejectsUnknownFieldsAndExtraDocuments(t *testing.T) {
 
 func TestCreateGeneratesPrivateKeyAndUpdatePreservesUnspecifiedFields(t *testing.T) {
 	st := testStore(t)
-	if err := seedProvider(st); err != nil {
+	if err := seedConnection(st); err != nil {
 		t.Fatal(err)
 	}
 	file := completeFile("demo")
@@ -47,7 +48,6 @@ func TestCreateGeneratesPrivateKeyAndUpdatePreservesUnspecifiedFields(t *testing
 	oldOpus := p.Models["opus"]
 	newSonnet := config.Binding{
 		PublicModel: "claude-updated-sonnet",
-		Provider:    "provider",
 		Connection:  "default",
 		TargetModel: "model-a",
 		Label:       "Updated sonnet",
@@ -71,7 +71,7 @@ func TestCreateGeneratesPrivateKeyAndUpdatePreservesUnspecifiedFields(t *testing
 
 func TestCreateValidatesAllSlotsAndReferences(t *testing.T) {
 	st := testStore(t)
-	if err := seedProvider(st); err != nil {
+	if err := seedConnection(st); err != nil {
 		t.Fatal(err)
 	}
 	file := completeFile("demo")
@@ -95,9 +95,9 @@ func TestCreateValidatesAllSlotsAndReferences(t *testing.T) {
 	}
 }
 
-func TestRemoveRequiresReferenceCheckAndDeletesKey(t *testing.T) {
+func TestRemoveKeepsSharedKeyReference(t *testing.T) {
 	st := testStore(t)
-	if err := seedProvider(st); err != nil {
+	if err := seedConnection(st); err != nil {
 		t.Fatal(err)
 	}
 	key, err := Create(st, completeFile("demo"))
@@ -108,11 +108,16 @@ func TestRemoveRequiresReferenceCheckAndDeletesKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	profileID, keyRef := s.Profiles["demo"].ID, s.Profiles["demo"].KeyRef
+	first := s.Profiles["demo"]
+	second := first
+	second.Name = "other"
+	if err := st.Update(func(state *config.State) error { state.Profiles["other"] = second; return nil }); err != nil {
+		t.Fatal(err)
+	}
 	wasChecked := false
 	if err := Remove(st, "demo", func(id string) (bool, error) {
 		wasChecked = true
-		if id != profileID {
+		if id != first.ID {
 			t.Errorf("agent 引用检查拿到意外 ID：%s", id)
 		}
 		return true, nil
@@ -129,11 +134,18 @@ func TestRemoveRequiresReferenceCheckAndDeletesKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := s.Profiles["demo"]; ok {
-		t.Fatal("profile 删除未生效")
+	if _, ok := s.Secrets[first.KeyRef]; !ok || s.Secrets[first.KeyRef] != key {
+		t.Fatal("共享 profile key 引用不应被提前回收")
 	}
-	if _, ok := s.Secrets[keyRef]; ok || key == "" {
-		t.Fatal("profile key 删除未清理")
+	if err := Remove(st, "other", func(string) (bool, error) { return false, nil }); err != nil {
+		t.Fatal(err)
+	}
+	s, err = st.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.Secrets[first.KeyRef]; ok {
+		t.Fatal("最后一个 profile 移除后 key 应回收")
 	}
 }
 
@@ -150,22 +162,13 @@ func testStore(t *testing.T) *store.Store {
 	return st
 }
 
-func seedProvider(st *store.Store) error {
+func seedConnection(st *store.Store) error {
 	return st.Update(func(s *config.State) error {
 		s.Secrets["test-key"] = "upstream-key"
-		s.Providers["provider"] = config.Provider{
-			Name:                 "provider",
-			DefaultCredentialRef: "test-key",
-			Connections: map[string]config.Connection{
-				"default": {
-					ID:       "profile-test-connection",
-					AuthType: config.AuthAPIKey,
-					Name:     "default",
-					Protocol: config.Chat,
-					BaseURL:  "https://api.example.test",
-					Models:   []config.Model{{ID: "model-a"}, {ID: "model-b"}},
-				},
-			},
+		s.Connections["default"] = config.Connection{
+			ID: "profile-test-connection", AuthType: config.AuthAPIKey, Name: "default", Protocol: config.Chat,
+			BaseURL: "https://api.example.test", CredentialRef: "test-key",
+			Models: []config.Model{{ID: "model-a"}, {ID: "model-b"}},
 		}
 		return nil
 	})
@@ -176,24 +179,9 @@ func completeFile(name string) File {
 		Name:  stringPointer(name),
 		Agent: stringPointer("claude-code"),
 		Models: map[string]config.Binding{
-			"opus": {
-				PublicModel: "claude-example-opus",
-				Provider:    "provider",
-				Connection:  "default",
-				TargetModel: "model-a",
-			},
-			"sonnet": {
-				PublicModel: "claude-example-sonnet",
-				Provider:    "provider",
-				Connection:  "default",
-				TargetModel: "model-a",
-			},
-			"haiku": {
-				PublicModel: "claude-example-haiku",
-				Provider:    "provider",
-				Connection:  "default",
-				TargetModel: "model-b",
-			},
+			"opus":   {PublicModel: "claude-example-opus", Connection: "default", TargetModel: "model-a"},
+			"sonnet": {PublicModel: "claude-example-sonnet", Connection: "default", TargetModel: "model-a"},
+			"haiku":  {PublicModel: "claude-example-haiku", Connection: "default", TargetModel: "model-b"},
 		},
 	}
 }

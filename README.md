@@ -5,12 +5,13 @@
 ## 配置模型
 
 ```text
-provider：服务提供商配置（可选默认上游 API key）
-  └── connection：协议、认证方式、API 根地址、专属凭证与模型清单
-profile：下游 Agent 的专属 key、三档模型绑定与展示
+connection：独立上游连接（稳定 ID、协议、认证方式、API 根地址、专属凭证、模型清单）
+profile：下游 Agent 的专属 key、三档 connection/实际模型绑定与展示
 ```
 
-提供商名称不决定协议。例如一个 `deepseek` provider 可以配置 Chat Completions、Anthropic Messages 和 Responses 三个 connection。每个 profile 的 Opus、Sonnet、Haiku 档位明确选择 provider、connection 和实际模型 ID。
+接入只需创建一个 connection，不需要先创建 provider。每个连接独立选择协议和凭证，名称不决定协议。每个 profile 的 Opus、Sonnet、Haiku 档位直接选择 connection 和实际模型 ID；多个档位可以使用同一连接。
+
+**这是不兼容旧配置的结构调整。** 当前只支持 schema 3，不保留 `provider` 命令、旧 profile 的 `provider` 字段或旧状态迁移。schema 1，以及旧 provider 版和独立 API-key 版 schema 2，均明确拒绝且不会被覆盖。已有配置的用户应先用原版本执行 restore、停止旧服务，再用新的 `--state-dir` 重新接入；OAuth 连接需要重新登录。不要让旧、新版本共享状态目录。
 
 下游公开模型 ID 保持为 Claude ID。不同 profile 可以使用相同公开 ID，但展示不同名称并路由到不同上游。
 
@@ -71,9 +72,20 @@ Release 不是预发布版，因此 `/releases/latest` 始终指向最新一次�
 git tag v2026.10.5-abc123 && git push origin refs/tags/v2026.10.5-abc123
 ```
 
-## 接入提供商
+## 接入上游
 
-准备模型清单（必须填写上游真实支持的模型 ID）：
+交互接入只需一条命令：
+
+```sh
+cpagw connection add
+# 也可以先指定名称：cpagw connection add example
+```
+
+向导依次收集连接名称、认证方式、协议、API 根地址、模型清单和凭证信息，确认后一次保存。API-key 连接使用隐藏输入；Codex OAuth 连接不询问 key，创建后单独登录。认证方式、协议、模型来源、继续添加模型和最终确认均使用 **↑/↓ 选择、Enter 确认**，不需要输入数字编号或 `y/n`；保存和删除确认默认选中“取消”。直接录入模型时，每条使用 `ID` 或 `ID=展示名`，之后选择“继续添加模型”或“完成录入”；也可以选择 YAML 文件，不必先创建文件。
+
+在文本、选择菜单、密码和确认阶段都可按 **Control+C** 取消；命令提示“已取消”，以退出码 130 返回 shell 并恢复终端。保存前（包括等待状态锁时）取消不会保存连接、凭证或增加 revision；原子提交开始后不保证撤回，保存成功后的重载失败仍会明确报告已保存。添加默认不联网、不发模型请求。
+
+脚本接入先准备模型清单（必须填写上游真实支持的模型 ID）：
 
 ```yaml
 models:
@@ -85,18 +97,21 @@ models:
     name: 快速模型
 ```
 
+将 key 从标准输入传入，不要将其放进命令参数或 shell 历史：
+
 ```sh
-cpagw provider add deepseek
-cpagw provider connection add deepseek anthropic \
+# 从安全的凭证来源提供 stdin；不要在命令中硬编码 key。
+cpagw connection add example \
   --protocol anthropic-messages \
-  --base-url https://api.deepseek.com/anthropic \
-  --models models.yaml
-cpagw provider show deepseek
-cpagw provider models deepseek --connection anthropic
-cpagw provider check deepseek --connection anthropic
+  --base-url https://api.example.com \
+  --models models.yaml \
+  --api-key-stdin
+cpagw connection show example
+cpagw connection models example
+cpagw connection check example
 ```
 
-provider add 通过隐藏输入读取默认 key。非交互场景使用 `--api-key-stdin`，不要将 key 放进命令参数。API-key connection 默认继承 provider key，使用同名选项可以独立覆盖；update 的 `--inherit-api-key` 清除覆盖。OAuth connection 不继承 provider 默认 key。show/list 仅显示认证方式与凭证就绪状态，不回显 key、凭证引用或账户标识。
+API-key 非交互接入必须提供完整参数和 `--api-key-stdin`；OAuth 非交互接入显式指定 `--auth-type codex-oauth`、`--protocol responses` 和模型清单，不提供 API key。缺参会报错而不会等待向导。每个连接持有自己的凭证，不存在默认 key 继承或隐藏的 provider。show/list 仅显示认证方式与凭证就绪状态，不回显 key、token、凭证引用或账户标识。
 
 ### Codex OAuth
 
@@ -113,21 +128,20 @@ models:
 `gpt-5.5` 仅为示例，使用前请确认自己的账号实际支持该模型，并据此填写模型清单与 profile 绑定。
 
 ```sh
-cpagw provider add openai --no-default-key
-cpagw provider connection add openai codex \
+cpagw connection add codex \
   --auth-type codex-oauth \
   --protocol responses \
   --models codex-models.yaml
-cpagw provider connection login openai codex
-# bindings.yaml 的 opus/sonnet/haiku 均设置 provider: openai、connection: codex、target_model: gpt-5.5
+cpagw connection login codex --no-browser
+# bindings.yaml 的 opus/sonnet/haiku 均设置 connection: codex、target_model: gpt-5.5
 cpagw profile create codex --agent claude-code --file bindings.yaml
 cpagw server start
 cpagw profile apply codex
 cpagw server stop
-cpagw provider connection logout openai codex --yes
+cpagw connection logout codex --yes
 ```
 
-认证方式切换必须在 `provider connection update` 中显式传 `--auth-type`；切换为 API key 时还需在同一命令显式提供 `--api-key-stdin` 或 `--inherit-api-key`，不能静默继承。新增 OAuth 连接、`login`、`logout`、重登录以及 OAuth 认证类型切换、删除 OAuth 连接/包含 OAuth 连接的 provider，均要求先停止网关；API-key 连接仍支持热更新。连接保留，logout 只清除本地保存的 OAuth 凭证，不代表向上游撤销授权。OAuth 凭证属于本地敏感状态，可能以明文保存但文件权限限制为 0600；请勿提交或分享状态文件。OAuth 账号可用模型取决于账号实际授权及 SDK 注册目录；模型清单只是本地声明，不保证账号支持该模型，也不意味着任意 Responses 服务兼容。OAuth 检查不会携带 access token 请求通用 `/models` endpoint。
+认证方式切换必须在 `connection update` 中显式传 `--auth-type`；切换为 API key 时还需在同一命令显式提供 `--api-key-stdin`，不能继承或回退。新增 OAuth 连接、`login`、`logout`、重登录、认证类型切换及删除 OAuth 连接，均要求先停止网关；API-key 连接仍支持热更新。连接保留，logout 只清除本地保存的 OAuth 凭证，不代表向上游撤销授权。OAuth 凭证属于本地敏感状态，可能以明文保存但文件权限限制为 0600；请勿提交或分享状态文件。OAuth 账号可用模型取决于账号实际授权及 SDK 注册目录；模型清单只是本地声明，不保证账号支持该模型，也不意味着任意 Responses 服务兼容。OAuth 检查不会携带 access token 请求通用 `/models` endpoint。
 
 上游协议：
 
@@ -166,21 +180,20 @@ restore **仅对有有效 cpagw 接管记录的配置执行**。它恢复首次�
 ## 更新与删除
 
 ```sh
-cpagw provider update deepseek --api-key-stdin
-cpagw provider connection update deepseek anthropic --models models.yaml
-cpagw provider connection update deepseek anthropic --inherit-api-key
-cpagw provider connection remove deepseek anthropic
-cpagw provider remove deepseek
+cpagw connection update example --api-key-stdin
+cpagw connection update example --models models.yaml
+cpagw connection update example --base-url https://api.example.com
+cpagw connection remove example
 cpagw profile delete daily
 ```
 
-更新默认 key 只影响继承连接，不覆盖连接自己的 key。删除 provider/connection 或移除模型前检查 profile 引用，存在引用时拒绝。被活动 apply 记录引用的 profile 需先 restore 或切换到其他 profile。
+更新未指定 key 时保留连接的原凭证；地址、模型与 key 同时修改时按同一事务保存。轮换只影响目标连接。删除连接或移除模型前检查 profile 引用，存在引用时拒绝。被活动 apply 记录引用的 profile 需先 restore 或切换到其他 profile；解除 profile 对连接的引用后才能删除连接。非交互删除需提供 `--yes`。
 
 ## 本地状态与安全
 
 - 状态目录默认为 `$XDG_CONFIG_HOME/cpagw`，未设置时使用 `~/.config/cpagw`；可用 `--state-dir` 隔离。
 - 状态目录 0700、敏感文件 0600；配置、secret 引用及 secret 数据以同一原子事务保存。上游 key、Codex OAuth 凭证和下游 profile key 分开管理，SDK 配置是私有派生数据。
-- 当前状态格式为 schema v2。升级前停止网关，然后运行 `cpagw state migrate`；迁移按版本逐版执行，本版本提供 v1→v2 转换并在原子升级前保存受限权限备份。迁移完成后，旧 binary 不支持读取 v2 状态，需使用支持该格式的新版本。
+- 当前状态格式为 schema 3，仅接受显式认证方式、稳定连接 ID 与独立 OAuth 表的完整新格式；不存在 `state migrate` 或自动默认化。旧 schema 1/2 及 provider 结构会拒绝读取/覆盖，使用新状态目录重新配置，OAuth 连接重新登录。
 - 本地状态和 Claude Code 应用后的 settings 都可能含明文 key；文件权限保护不是加密保险箱。不要提交或分享这些文件。
 - 默认仅监听 loopback；后台和前台启动都会预检查监听地址，端口冲突时明确报告占用地址，不启动网关，也不停止原占用服务。预检查分两步：先探测同端口的 `127.0.0.1` 与 `::1` 是否已有服务监听，再验证地址可绑定。**只做绑定检查并不足够**——macOS 允许通配监听（如 `*:8317`）与具体 loopback 地址同时绑成功，绑定成功不能证明端口空闲。预检查会立即释放临时监听器，正式监听和实例就绪校验仍负责处理之后的端口竞争。
 - 下游只开放模型列表、Messages 及支持的 count_tokens，其他执行协议及管理入口不向 profile key 开放。

@@ -495,6 +495,9 @@ func TestResponseBodyCancellationAndTimeout(t *testing.T) {
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
 				started := make(chan struct{})
+				release := make(chan struct{})
+				var releaseOnce sync.Once
+				defer releaseOnce.Do(func() { close(release) })
 				f.hook = func(w http.ResponseWriter, r *http.Request) bool {
 					if !strings.HasSuffix(r.URL.Path, "/"+asset) {
 						return false
@@ -502,21 +505,28 @@ func TestResponseBodyCancellationAndTimeout(t *testing.T) {
 					w.Write([]byte("partial"))
 					w.(http.Flusher).Flush()
 					close(started)
-					<-r.Context().Done()
+					// 等待客户端先完成取消或超时断言，避免响应结束和读取错误竞态。
+					<-release
 					return true
 				}
 				if timeout {
-					f.u.client.Timeout = 100 * time.Millisecond
-				} else {
-					go func() {
-						select {
-						case <-started:
-							cancel()
-						case <-ctx.Done():
-						}
-					}()
+					f.u.client.Timeout = 250 * time.Millisecond
 				}
-				_, err := f.u.run(ctx, "")
+				done := make(chan error, 1)
+				go func() {
+					_, err := f.u.run(ctx, "")
+					done <- err
+				}()
+				select {
+				case <-started:
+				case err := <-done:
+					t.Fatalf("响应体阶段开始前请求已失败：%v", err)
+				}
+				if !timeout {
+					cancel()
+				}
+				err := <-done
+				releaseOnce.Do(func() { close(release) })
 				if timeout {
 					if err == nil || !strings.Contains(err.Error(), "超时") {
 						t.Fatalf("响应读取中超时应清楚报告：%v", err)

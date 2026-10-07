@@ -63,7 +63,7 @@ func TestOAuthPersistenceFailureDuringRequestRejectsSuccessfulUpstreamResponse(t
 			credential := current.OAuthCredentials["oauth-a"]
 			credential.AccessToken = "newer-access-a"
 			credential.RefreshToken = "newer-refresh-a"
-			if _, err := st.SaveOAuth(store.OAuthBinding{Provider: "mixed", Connection: "a", ConnectionID: "connection-a", CredentialRef: "oauth-a", Generation: 1}, credential); err != nil {
+			if _, err := st.SaveOAuth(store.OAuthBinding{Connection: "a", ConnectionID: "connection-a", CredentialRef: "oauth-a", Generation: 1}, credential); err != nil {
 				return err
 			}
 			auth.Metadata["access_token"] = "stale-rotation-access"
@@ -115,7 +115,7 @@ func TestOAuthCASFailureRevokesOnlyTargetAndReloadCannotRestore(t *testing.T) {
 	credential := before.OAuthCredentials["oauth-a"]
 	credential.AccessToken = "newer-access-a"
 	credential.RefreshToken = "newer-refresh-a"
-	if _, err := st.SaveOAuth(store.OAuthBinding{Provider: "mixed", Connection: "a", ConnectionID: "connection-a", CredentialRef: "oauth-a", Generation: 1}, credential); err != nil {
+	if _, err := st.SaveOAuth(store.OAuthBinding{Connection: "a", ConnectionID: "connection-a", CredentialRef: "oauth-a", Generation: 1}, credential); err != nil {
 		t.Fatal(err)
 	}
 	auth.Metadata["access_token"] = "stale-rotation-access"

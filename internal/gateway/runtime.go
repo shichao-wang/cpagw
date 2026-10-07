@@ -262,7 +262,7 @@ func verifySnapshot(manager *coreauth.Manager, credentials *codexoauth.SDKStore,
 			if connection.authType == config.AuthAPIKey {
 				route.authID = staticAuthID(namespace, connection.id)
 				if !registry.ClientSupportsModel(route.authID, route.sdkModel) {
-					return fmt.Errorf("连接模型注册校验失败：%s/%s", connection.provider, connection.name)
+					return fmt.Errorf("连接模型注册校验失败：%s", connection.name)
 				}
 			} else {
 				route.authID = credentials.AuthID(connection.credentialRef)
@@ -289,7 +289,7 @@ func sameOAuthTopology(a, b *snapshot) bool {
 		out := map[string]string{}
 		for _, c := range s.connections {
 			if c.authType == config.AuthCodexOAuth {
-				out[c.id] = c.provider + "\x00" + c.name + "\x00" + c.baseURL + "\x00" + c.credentialRef
+				out[c.id] = c.name + "\x00" + c.baseURL + "\x00" + c.credentialRef
 			}
 		}
 		return out
