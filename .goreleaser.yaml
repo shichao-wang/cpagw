@@ -1,4 +1,4 @@
-# GoReleaser 配置：推送 v* tag 时构建各平台产物与校验和（见 .github/workflows/release.yml）。
+# GoReleaser 配置：PR 预演与 main 门禁通过后的发布共用四平台产物及校验和。
 # 需要 GoReleaser v2.6 以上（使用了 archives.formats 字段）。
 # 本地预览：goreleaser release --snapshot --clean
 version: 2

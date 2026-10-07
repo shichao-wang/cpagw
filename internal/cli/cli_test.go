@@ -314,6 +314,7 @@ type fakePrompter struct {
 	secretCalls    int
 	selectCalls    int
 	confirmCalls   int
+	closeCalls     int
 	selectedMenus  [][]promptOption
 	selectionTitle []string
 }
@@ -354,6 +355,10 @@ func (p *fakePrompter) Confirm(_ context.Context, _ string) (bool, error) {
 	p.selectionTitle = append(p.selectionTitle, "确认")
 	p.selectedMenus = append(p.selectedMenus, []promptOption{{label: "取消", value: "false"}, {label: "确认", value: "true"}})
 	return p.confirm, nil
+}
+func (p *fakePrompter) Close() error {
+	p.closeCalls++
+	return nil
 }
 
 func TestConnectionStdinModeDoesNotEnterWizardOnTTY(t *testing.T) {

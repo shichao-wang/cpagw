@@ -145,6 +145,7 @@ func confirmRemoval(cmd *cobra.Command, yes bool, subject string) error {
 		return nil
 	}
 	p := newTerminalPrompter(cmd.InOrStdin(), cmd.ErrOrStderr())
+	defer p.Close()
 	if !p.IsTerminal() {
 		return fmt.Errorf("非交互环境删除操作必须提供 --yes")
 	}

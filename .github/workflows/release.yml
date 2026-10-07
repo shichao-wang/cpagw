@@ -1,41 +1,142 @@
 name: release
 
-# PR 合并进 main 且测试通过后，自动打 tag 并发布 Release。
-#
-# 为什么只用一个文件：GITHUB_TOKEN 推送 tag 不会触发其它 workflow（GitHub 防递归
-# 限制），若把 CI 与发布拆开，跨 workflow 传递 tag 名只能靠反查，既脆弱又难验证。
-# 单个文件里 tag 是 job 输出，用 needs 串起「测试 → 打 tag → 发布」即可。
-# 推 tag 也不会触发本 workflow：on.push 限定了 branches: [main]。
+# PR、main push 与 merge queue 候选共用相同的测试和发布产物预检。
 on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
 
 jobs:
   test:
+    name: test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
 
+      - name: Test
+        run: go test -count=1 ./...
+
+      - name: Repeat terminal integration test
+        run: go test -count=3 ./internal/integration -run '^TestWizardTerminal$'
+
+      - name: Race test
+        run: go test -race -count=1 ./...
+
       - name: Vet
         run: go vet ./...
 
+      - name: Build
+        run: go build -o "$RUNNER_TEMP/cpagw" ./cmd/cpagw
+
+  test-macos:
+    name: test-macos
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
       - name: Test
-        run: go test ./...
+        run: go test -count=1 ./...
+
+      - name: Repeat terminal integration test
+        run: go test -count=3 ./internal/integration -run '^TestWizardTerminal$'
+
+      - name: Race test
+        run: go test -race -count=1 ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build -o "$RUNNER_TEMP/cpagw" ./cmd/cpagw
+
+  release-preview:
+    name: release-preview
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TMPDIR: ${{ runner.temp }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Validate GoReleaser configuration
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: v2.18.2
+          args: check
+
+      # Snapshot 不执行正式 tag/git validate，也不访问发布 API；这里只验证构建和打包链路。
+      - name: Build release snapshot
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: v2.18.2
+          args: release --snapshot --clean
+
+      - name: Verify release archives and checksums
+        run: python3 -I scripts/verify-release-artifacts.py dist
+
+      - name: Test release artifact verifier
+        run: python3 -I scripts/verify_release_artifacts_test.py
+
+      - name: Test fail-closed gate verifier
+        run: python3 -I scripts/verify_ci_gate_test.py
+
+  ci:
+    name: ci / pre-merge
+    if: ${{ always() }}
+    needs: [test, test-macos, release-preview]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Require every prerequisite to succeed
+        env:
+          LINUX_RESULT: ${{ needs.test.result }}
+          MACOS_RESULT: ${{ needs.test-macos.result }}
+          RELEASE_PREVIEW_RESULT: ${{ needs.release-preview.result }}
+        run: bash scripts/verify-ci-gate.sh "$LINUX_RESULT" "$MACOS_RESULT" "$RELEASE_PREVIEW_RESULT"
 
   tag:
-    needs: test
-    # 仅对合并进 main 的 push 打 tag；PR 事件只跑 test。
-    if: github.event_name == 'push'
+    needs: ci
+    # 只在 main push 且合并前汇总检查通过后打 tag。
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.ci.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -94,6 +195,7 @@ jobs:
         with:
           ref: ${{ needs.tag.outputs.tag }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -104,7 +206,7 @@ jobs:
         uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
-          version: "~> v2"
+          version: v2.18.2
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -33,6 +33,7 @@ func newConnectionCommandWithPrompter(open storeFactory, opts Options, prompter 
 			if p == nil {
 				p = newTerminalPrompter(cmd.InOrStdin(), cmd.ErrOrStderr())
 			}
+			defer p.Close()
 			name := ""
 			if len(args) == 1 {
 				name = args[0]
@@ -155,10 +156,8 @@ func newConnectionCommandWithPrompter(open storeFactory, opts Options, prompter 
 				return sanitizeCredentialError(err)
 			}
 			if p.IsTerminal() && !apiKeyStdin {
-				if _, err := fmt.Fprintf(cmd.OutOrStdout(), "\n连接摘要\n名称：%s\n认证方式：%s\n协议：%s\nAPI 根地址：%s\n模型数：%d\n", c.Name, c.AuthType, c.Protocol, c.BaseURL, len(c.Models)); err != nil {
-					return err
-				}
-				confirmed, err := p.Confirm(cmd.Context(), "确认保存此连接？")
+				summary := fmt.Sprintf("连接摘要\n名称：%s\n认证方式：%s\n协议：%s\nAPI 根地址：%s\n模型数：%d\n确认保存此连接？", c.Name, c.AuthType, c.Protocol, c.BaseURL, len(c.Models))
+				confirmed, err := p.Confirm(cmd.Context(), summary)
 				if err != nil {
 					return err
 				}
@@ -167,6 +166,9 @@ func newConnectionCommandWithPrompter(open storeFactory, opts Options, prompter 
 				}
 			}
 			if err = cmd.Context().Err(); err != nil {
+				return err
+			}
+			if err = p.Close(); err != nil {
 				return err
 			}
 			if err = connection.Create(cmd.Context(), st, c, key); err != nil {

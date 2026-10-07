@@ -58,18 +58,22 @@ SDK 固定为 CLIProxyAPI v8.0.10。分发时请附上 `THIRD_PARTY_NOTICES`，�
 
 ## 发布
 
-合并 PR 到 `main` 后自动打 tag 并发布 Release：
+PR、`main` push 和 merge queue 候选会运行相同的合并前门禁：Linux/macOS 全量测试、重复终端 PTY 测试、race、vet、build，以及只读 GoReleaser snapshot 预演。固定 required check 为 `ci / pre-merge`；任何前置 job 失败、取消或跳过都不会放行。Snapshot 会检查四平台归档、必备文件、SHA256 与当前 runner 可执行的原生 binary，但不执行正式 tag/git validate，也不访问 GitHub Release API；这不等于正式发布验证。
+
+门禁通过后，仅 `main` push 会进入打 tag job；只有该提交由已合并 PR 引入时才生成 tag 并发布：
 
 ```text
-合并 PR → ci 通过 → 打 tag（v2026.10.5-abc123）→ GoReleaser 发布 Release
+合并 PR → ci / pre-merge 全部通过 → 打 tag（v2026.10.5-abc123）→ GoReleaser 发布 Release
 ```
 
-tag 由日期与 commit 短 SHA 组成，不含补零（`2026.10.5` 而非 `2026.10.05`），否则不是合法 semver，GoReleaser 会拒绝。**直接 push 到 `main` 不会发布**，只有经 PR 合并的提交才触发。
+tag 由日期与 commit 短 SHA 组成，不含补零（`2026.10.5` 而非 `2026.10.05`），否则不是合法 semver，GoReleaser 会拒绝。**直接 push 到 `main` 不会发布**，merge queue 只运行检查、不打 tag 或发布。
 
-Release 不是预发布版，因此 `/releases/latest` 始终指向最新一次发布，安装脚本无需指定版本即可取用。手动发布可在目标 commit 上推一个 `v*` tag：
+成功发布的 Release 不标记为预发布版，安装脚本默认通过 `/releases/latest` 获取最新正式产物。当前工作流不监听 tag push，**只推送 `v*` tag 不会触发发布**。本地可用同一配置预演（GoReleaser v2.18.2）：
 
 ```sh
-git tag v2026.10.5-abc123 && git push origin refs/tags/v2026.10.5-abc123
+goreleaser check
+goreleaser release --snapshot --clean
+python3 -I scripts/verify-release-artifacts.py dist
 ```
 
 ## 接入上游

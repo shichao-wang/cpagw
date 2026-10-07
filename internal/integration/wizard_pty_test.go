@@ -3,6 +3,7 @@ package integration
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -139,6 +140,90 @@ func TestWizardTerminal(t *testing.T) {
 		if bytes.Contains(before, []byte(wizardTestKey)) || strings.Contains(terminal.trace(), c.CredentialRef) {
 			t.Fatal("凭证或引用出现在不应包含秘密的位置")
 		}
+	})
+
+	t.Run("多模型快速录入", func(t *testing.T) {
+		dir, _ := newState(t)
+		terminal := startWizardTerminal(t, binary, dir)
+		advance(t, terminal, 5)
+		var expected []config.Model
+		for i := range 6 {
+			id, name := fmt.Sprintf("fast-%d", i), fmt.Sprintf("第 %d 个模型", i)
+			expected = append(expected, config.Model{ID: id, Name: name})
+			terminal.sendAndWait(t, id+"="+name+"\r", "模型录入（")
+			if i < 5 {
+				terminal.sendAndWait(t, "\x1b[B\r", "模型 ID")
+			}
+		}
+		terminal.sendAndWait(t, "\r", "API key（Enter")
+		terminal.sendAndWait(t, wizardTestKey+"\r", "确认保存此连接")
+		terminal.send(t, "\x1b[B\r")
+		terminal.waitExit(t, 0)
+		terminal.waitText(t, "已创建连接 terminal-test")
+		terminal.assertRestored(t)
+		state := readWizardState(t, dir)
+		c := state.Connections["terminal-test"]
+		if !reflect.DeepEqual(c.Models, expected) || state.Revision != 2 || len(state.Secrets) != 1 || state.Secrets[c.CredentialRef] != wizardTestKey {
+			t.Fatal("快速交接丢失了模型文本、凭证或单次事务语义")
+		}
+	})
+
+	t.Run("YAML快速录入", func(t *testing.T) {
+		dir, _ := newState(t)
+		models := filepath.Join(t.TempDir(), "模型清单.yaml")
+		if err := os.WriteFile(models, []byte("models:\n  - id: yaml-model\n    name: 文件模型\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		terminal := startWizardTerminal(t, binary, dir)
+		advance(t, terminal, 4)
+		terminal.sendAndWait(t, "\x1b[B\r", "模型 YAML 文件路径")
+		// 持续 renderer 会重用标题尾部；只匹配本次新输出的唯一密码标题前缀。
+		terminal.sendAndWait(t, models+"\r", "API key（")
+		terminal.sendAndWait(t, wizardTestKey+"\r", "确认保存此连接")
+		terminal.send(t, "\x1b[B\r")
+		terminal.waitExit(t, 0)
+		terminal.waitText(t, "已创建连接 terminal-test")
+		terminal.assertRestored(t)
+		state := readWizardState(t, dir)
+		c := state.Connections["terminal-test"]
+		if len(c.Models) != 1 || c.Models[0].ID != "yaml-model" || c.Models[0].Name != "文件模型" || state.Secrets[c.CredentialRef] != wizardTestKey || state.Revision != 2 {
+			t.Fatal("YAML 分支快速交接保存了错误内容")
+		}
+	})
+
+	t.Run("OAuth离线快速录入", func(t *testing.T) {
+		dir, _ := newState(t)
+		terminal := startWizardTerminal(t, binary, dir)
+		advance(t, terminal, 1)
+		terminal.sendAndWait(t, "\x1b[B\r", "模型来源")
+		terminal.sendAndWait(t, "\r", "模型 ID")
+		terminal.sendAndWait(t, "codex-model=离线测试\r", "模型录入（")
+		terminal.sendAndWait(t, "\r", "确认保存此连接")
+		terminal.send(t, "\x1b[B\r")
+		terminal.waitExit(t, 0)
+		terminal.waitText(t, "已创建连接 terminal-test")
+		terminal.assertRestored(t)
+		state := readWizardState(t, dir)
+		c := state.Connections["terminal-test"]
+		if c.AuthType != config.AuthCodexOAuth || c.Protocol != config.Responses || c.BaseURL != config.CodexBaseURL || c.ID == "" || len(c.Models) != 1 || c.Models[0].ID != "codex-model" || c.Models[0].Name != "离线测试" || len(state.Secrets) != 0 || len(state.OAuthCredentials) != 0 || state.Revision != 2 {
+			t.Fatal("OAuth 离线分支未保留明确认证、模型或无凭证约束")
+		}
+		if strings.Contains(terminal.trace(), "API 根地址：（Enter") || strings.Contains(terminal.trace(), "API key（Enter") {
+			t.Fatal("OAuth 分支错误地请求 API 地址或 key")
+		}
+	})
+
+	t.Run("空闲时CtrlC", func(t *testing.T) {
+		dir, before := newState(t)
+		terminal := startWizardTerminal(t, binary, dir)
+		advance(t, terminal, 7)
+		// 留出空闲读取时间；不是在发送输入之间加延时来掩盖丢字。
+		time.Sleep(150 * time.Millisecond)
+		terminal.send(t, "\x03")
+		terminal.waitExit(t, 130)
+		terminal.waitText(t, "已取消")
+		terminal.assertRestored(t)
+		assertWizardUnchanged(t, dir, before)
 	})
 
 	t.Run("确认默认取消", func(t *testing.T) {
@@ -297,14 +382,31 @@ var wizardOSC = regexp.MustCompile("\\x1b\\][^\\x07\\x1b]*(?:\\x07|\\x1b\\\\)")
 
 func (terminal *wizardTerminal) waitText(t *testing.T, text string) {
 	t.Helper()
+	terminal.waitTextAfter(t, text, 0)
+}
+
+func (terminal *wizardTerminal) sendAndWait(t *testing.T, input, next string) {
+	t.Helper()
+	after := len(terminal.trace())
+	terminal.send(t, input)
+	terminal.waitTextAfter(t, next, after)
+}
+
+func (terminal *wizardTerminal) waitTextAfter(t *testing.T, text string, after int) {
+	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		clean := wizardCSI.ReplaceAllString(wizardOSC.ReplaceAllString(terminal.trace(), ""), "")
+		trace := terminal.trace()
+		clean := wizardCSI.ReplaceAllString(wizardOSC.ReplaceAllString(trace[after:], ""), "")
 		if strings.Contains(clean, text) {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	t.Fatalf("终端未在限定时间内显示：%s；脱敏界面：%q", text, terminal.safeTrace())
+}
+
+func (terminal *wizardTerminal) safeTrace() string {
 	// 仅输出脱敏后的测试界面，便于定位不同平台的输入时序问题。
 	clean := wizardCSI.ReplaceAllString(wizardOSC.ReplaceAllString(terminal.trace(), ""), "")
 	clean = strings.ReplaceAll(clean, wizardTestKey, "[隐藏测试凭证]")
@@ -314,7 +416,7 @@ func (terminal *wizardTerminal) waitText(t *testing.T, text string) {
 	if len(clean) > 4096 {
 		clean = clean[len(clean)-4096:]
 	}
-	t.Fatalf("终端未在限定时间内显示：%s；脱敏界面：%q", text, clean)
+	return clean
 }
 
 func (terminal *wizardTerminal) send(t *testing.T, text string) {
@@ -329,25 +431,9 @@ func (terminal *wizardTerminal) send(t *testing.T, text string) {
 			data = data[n:]
 		}
 	}
-	// 按终端键盘事件驱动；文本按快速打字节奏逐字发送，方向键和提交仍是独立按键。
-	// Linux PTY 下更快的逐字写入会让表单事件循环偶发丢字，Enter 也可能先于输入处理。
-	time.Sleep(40 * time.Millisecond)
-	for _, part := range strings.SplitAfter(text, "\r") {
-		enter := strings.HasSuffix(part, "\r")
-		part = strings.TrimSuffix(part, "\r")
-		if strings.HasPrefix(part, "\x1b[") {
-			write(part)
-		} else {
-			for _, r := range part {
-				write(string(r))
-				time.Sleep(20 * time.Millisecond)
-			}
-		}
-		if enter {
-			time.Sleep(30 * time.Millisecond)
-			write("\r")
-		}
-	}
+	// 每个字段显示后整段发送输入及 Enter，不能用逐字 sleep 掩盖跨表单丢字。
+	// 方向键仍保留真实终端转义序列，由实际事件循环解析。
+	write(text)
 }
 
 func (terminal *wizardTerminal) waitExit(t *testing.T, code int) {
@@ -365,7 +451,7 @@ func (terminal *wizardTerminal) waitExit(t *testing.T, code int) {
 			}
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Control+C/信号未在限定时间内终止命令")
+		t.Fatalf("Control+C/信号未在限定时间内终止命令；脱敏界面：%q", terminal.safeTrace())
 	}
 }
 
@@ -396,6 +482,19 @@ func (terminal *wizardTerminal) assertRestored(t *testing.T) {
 	if strings.LastIndex(trace, "\x1b[?25l") > strings.LastIndex(trace, "\x1b[?25h") {
 		t.Fatal("退出后终端光标仍被隐藏")
 	}
+}
+
+func readWizardState(t *testing.T, dir string) *config.State {
+	t.Helper()
+	st, err := store.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := st.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return state
 }
 
 func assertWizardUnchanged(t *testing.T, dir string, before []byte) {
